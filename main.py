@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.2.6
+C盘强力清理工具 v0.2.8
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
 
-import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq
+import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re
 import urllib.request
 import webbrowser
 from collections import defaultdict
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QAbstractItemView, QTableWidgetItem, QStyledItemDelegate,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
-    QFileIconProvider, QFileDialog
+    QFileIconProvider, QFileDialog, QDialog
 )
 
 from qfluentwidgets import (
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.2.6"
+CURRENT_VERSION = "0.2.8"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -450,37 +450,19 @@ if ($partition) {{
 
 def get_scan_threads(drive_letter="C"):
     dtype = detect_disk_type(drive_letter)
-    return {"SSD": 16, "HDD": 2, "Unknown": 4}.get(dtype, 4), dtype
+    return {"SSD": 12, "HDD": 2, "Unknown": 4}.get(dtype, 4), dtype
 
 def get_scan_threads_cached(drive_letter="C"):
-    drive_letter = str(drive_letter or "C").upper().replace("\\", "").replace(":", "")[:1] or "C"
-    cache_key = f"{drive_letter}:"
     try:
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 cache = json.load(f)
-            if isinstance(cache.get("drives"), dict):
-                entry = cache["drives"].get(cache_key)
-                if entry and time.time() - entry.get("ts", 0) < 86400:
-                    return entry["threads"], entry["dtype"]
-            elif time.time() - cache.get("ts", 0) < 86400:
+            if time.time() - cache.get("ts", 0) < 86400:
                 return cache["threads"], cache["dtype"]
     except: pass
     threads, dtype = get_scan_threads(drive_letter)
     try:
-        cache = {}
-        if os.path.exists(CACHE_FILE):
-            try:
-                with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-            except:
-                cache = {}
-        drives_cache = cache.get("drives", {}) if isinstance(cache, dict) else {}
-        if not isinstance(drives_cache, dict):
-            drives_cache = {}
-        drives_cache[cache_key] = {"threads": threads, "dtype": dtype, "ts": time.time()}
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"drives": drives_cache}, f)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump({"threads": threads, "dtype": dtype, "ts": time.time()}, f)
     except: pass
     return threads, dtype
 
@@ -549,7 +531,7 @@ def should_exclude(p, prefixes):
 # ══════════════════════════════════════════════════════════
 _SENTINEL = None
 
-def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock, limit=None):
+def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock):
     while not stop_flag.is_set():
         try: dirpath = dir_queue.get(timeout=0.05)
         except queue.Empty: continue
@@ -573,48 +555,15 @@ def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock, limit
             try: entries.close()
             except: pass
         if local_res or local_count:
-            with lock:
-                if limit and limit > 0:
-                    for item in local_res:
-                        _push_top_file(results, item, limit)
-                else:
-                    results.extend(local_res)
-                counter[0] += local_count
+            with lock: results.extend(local_res); counter[0] += local_count
         dir_queue.task_done()
 
-def _push_top_file(results, item, limit):
-    if limit and limit > 0:
-        if len(results) < limit:
-            heapq.heappush(results, item)
-        elif item[0] > results[0][0]:
-            heapq.heapreplace(results, item)
-    else:
-        results.append(item)
-
-def get_drive_scan_profile(roots):
-    info = []
-    for root in roots or []:
-        drive = os.path.splitdrive(str(root))[0].upper().replace(":", "")
-        if not drive:
-            continue
-        threads, dtype = get_scan_threads_cached(drive)
-        info.append((drive, threads, dtype))
-    if not info:
-        return 4, "Unknown"
-    if len(info) == 1:
-        _, threads, dtype = info[0]
-        return threads, dtype
-    workers = max(item[1] for item in info)
-    dtypes = {item[2] for item in info}
-    dtype = "混合" if len(dtypes) > 1 else next(iter(dtypes))
-    return workers, dtype
-
-def scan_big_files(roots, min_b, excl, stop, cb, workers=4, limit=None):
+def scan_big_files(roots, min_b, excl, stop, cb, workers=4):
     dir_queue = queue.Queue(); results = []; counter = [0]; lock = threading.Lock()
     for root in roots: dir_queue.put(root)
     threads = []
     for _ in range(workers):
-        t = threading.Thread(target=_dir_worker, args=(dir_queue, min_b, excl, stop, results, counter, lock, limit), daemon=True)
+        t = threading.Thread(target=_dir_worker, args=(dir_queue, min_b, excl, stop, results, counter, lock), daemon=True)
         t.start(); threads.append(t)
     tk = time.time()
     while not stop.is_set():
@@ -636,8 +585,10 @@ class Sig(QObject):
     log=Signal(str); prog=Signal(int,int); est=Signal(int,int)
     big_clr=Signal(); big_add=Signal(str,str); done=Signal(str)
     disk_ready=Signal(str,int); update_found=Signal(str, str, str)
+    update_status=Signal(str, str, str)
+    update_latest=Signal(str)
     more_clr=Signal(); more_add=Signal(bool, str, str, str, str)
-    uninst_clr=Signal(); uninst_add=Signal(str, str, str, str, str, str, str)
+    uninst_clr=Signal(); uninst_add=Signal(object)
 
 def style_table(tbl: TableWidget):
     setFont(tbl, 12, QFont.Weight.Normal)
@@ -717,6 +668,231 @@ def app_root_dir():
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
+SYSTEM_SOFTWARE_NAME_KEYWORDS = (
+    "microsoft windows", "windows update", "update for microsoft windows", "security update",
+    "hotfix", "service pack", "windows driver package", "驱动程序", "驱动包",
+    "chipset", "firmware", "bios", "uefi", "management engine", "serial io",
+    "rapid storage", "bluetooth driver", "wireless lan driver", "audio driver",
+    "display driver", "graphics driver"
+)
+
+SYSTEM_SOFTWARE_PUBLISHER_KEYWORDS = (
+    "microsoft windows", "intel", "advanced micro devices", "amd", "nvidia",
+    "realtek", "qualcomm", "mediatek"
+)
+
+SYSTEM_IMPACT_NAME_KEYWORDS = (
+    "visual c++", "redistributable", ".net", "desktop runtime", "runtime",
+    "webview2", "directx", "driver", "security", "defender", "antivirus",
+    "firewall", "endpoint", "vpn"
+)
+
+SYSTEM_IMPACT_PUBLISHER_KEYWORDS = (
+    "microsoft", "intel", "amd", "nvidia", "realtek", "eset", "kaspersky",
+    "bitdefender", "symantec", "mcafee", "vmware", "virtualbox"
+)
+
+def classify_uninstall_entry(name, publisher, install_location, reg_path):
+    name_text = str(name or "").strip()
+    publisher_text = str(publisher or "").strip()
+    path_text = norm_path(install_location)
+    reg_text = str(reg_path or "").strip()
+
+    name_lower = name_text.lower()
+    publisher_lower = publisher_text.lower()
+    path_lower = path_text.lower()
+    reg_lower = reg_text.lower()
+
+    system_root = os.environ.get("SystemRoot", r"C:\Windows").lower()
+    system_path_prefixes = (
+        system_root,
+        os.path.join(system_root, "system32").lower(),
+        os.path.join(system_root, "winsxs").lower(),
+        os.path.join(system_root, "systemapps").lower(),
+        os.path.join(system_root, "servicing").lower(),
+        os.path.join(system_root, "installer").lower(),
+        os.path.join(system_root, "driverstore").lower(),
+    )
+
+    is_windows_path = bool(path_lower) and any(path_lower.startswith(prefix) for prefix in system_path_prefixes)
+    is_kb_update = bool(re.search(r"(^|[\s_(])kb\d{4,}", name_lower)) or bool(re.search(r"\\kb\d{4,}$", reg_lower))
+    is_windows_component = any(keyword in name_lower for keyword in SYSTEM_SOFTWARE_NAME_KEYWORDS)
+    is_driver_vendor = any(keyword in publisher_lower for keyword in SYSTEM_SOFTWARE_PUBLISHER_KEYWORDS) and any(
+        token in name_lower for token in ("driver", "chipset", "audio", "bluetooth", "wireless", "graphics", "display", "firmware")
+    )
+
+    if is_windows_path or is_kb_update or is_windows_component or is_driver_vendor:
+        return {
+            "category": "系统",
+            "is_risky": True,
+            "risk_kind": "system",
+            "risk_reason": "系统组件、补丁或驱动，卸载后可能影响系统功能或硬件工作"
+        }
+
+    is_sensitive_runtime = any(keyword in name_lower for keyword in SYSTEM_IMPACT_NAME_KEYWORDS)
+    is_sensitive_vendor = any(keyword in publisher_lower for keyword in SYSTEM_IMPACT_PUBLISHER_KEYWORDS) and any(
+        token in name_lower for token in ("runtime", "redistributable", ".net", "webview2", "security", "antivirus", "vpn", "driver")
+    )
+
+    if is_sensitive_runtime or is_sensitive_vendor:
+        return {
+            "category": "用户",
+            "is_risky": True,
+            "risk_kind": "impact",
+            "risk_reason": "运行库、驱动或安全类软件，卸载后可能影响系统或其他软件"
+        }
+
+    return {
+        "category": "用户",
+        "is_risky": False,
+        "risk_kind": "",
+        "risk_reason": ""
+    }
+
+SAMPLE_RULE_PACKS = [
+    ("通用规则", "common_custom_rules.json"),
+    ("国产软件", "rules_cn_apps.json"),
+    ("开发工具", "rules_dev_tools.json"),
+    ("游戏平台", "rules_game_platforms.json")
+]
+RULE_STORE_INDEX_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/config_store.json"
+RULE_PACK_DOWNLOAD_BASE = "https://gitee.com/kio0/c_cleaner_plus/raw/master/config"
+
+def _normalize_rule_store_item(item):
+    if not isinstance(item, dict):
+        return None
+
+    title = str(item.get("title", "")).strip()
+    filename = str(item.get("filename", "")).strip()
+    if not title or not filename:
+        return None
+
+    return {
+        "title": title,
+        "filename": filename,
+        "source": str(item.get("source", "")).strip() or "远程规则源",
+        "summary": str(item.get("summary", "")).strip(),
+        "detail": str(item.get("detail", "")).strip() or "暂无详细介绍。"
+    }
+
+def load_rule_store_items():
+    try:
+        with urllib.request.urlopen(RULE_STORE_INDEX_URL, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        if isinstance(payload, dict):
+            raw_items = payload.get("items", [])
+        elif isinstance(payload, list):
+            raw_items = payload
+        else:
+            raw_items = []
+
+        items = []
+        for raw in raw_items:
+            normalized = _normalize_rule_store_item(raw)
+            if normalized:
+                items.append(normalized)
+
+        if items:
+            return items, ""
+        return [], "远程规则清单为空或缺少有效条目"
+    except Exception as e:
+        return [], f"远程规则清单获取失败: {e}"
+
+def get_rule_pack_cache_dir(base_dir=None):
+    if base_dir:
+        return base_dir
+    return os.path.join(app_root_dir(), "config")
+
+def list_rule_pack_cache_records(store_items, base_dir):
+    item_map = {}
+    for item in store_items or []:
+        if not isinstance(item, dict):
+            continue
+        filename = str(item.get("filename", "")).strip()
+        if filename and filename not in item_map:
+            item_map[filename] = item
+
+    records = []
+    seen = set()
+
+    for filename, item in item_map.items():
+        path = os.path.join(base_dir, filename)
+        if os.path.isfile(path):
+            seen.add(filename.lower())
+            records.append({
+                "title": item.get("title", filename),
+                "filename": filename,
+                "path": path,
+                "size": safe_getsize(path)
+            })
+
+    try:
+        for filename in os.listdir(base_dir):
+            path = os.path.join(base_dir, filename)
+            if not os.path.isfile(path):
+                continue
+            if not filename.lower().endswith(".json"):
+                continue
+            if filename.lower() in seen:
+                continue
+            records.append({
+                "title": os.path.splitext(filename)[0],
+                "filename": filename,
+                "path": path,
+                "size": safe_getsize(path)
+            })
+    except Exception:
+        pass
+
+    records.sort(key=lambda x: x["title"].lower())
+    return records
+
+def get_sample_rule_pack_path(filename, base_dir=None):
+    candidates = [
+        os.path.join(get_rule_pack_cache_dir(base_dir), filename),
+        os.path.join(app_root_dir(), filename),
+        resource_path(filename)
+    ]
+    seen = set()
+    for path in candidates:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+def download_rule_pack(filename, base_dir=None):
+    local_path = os.path.join(get_rule_pack_cache_dir(base_dir), filename)
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    url = f"{RULE_PACK_DOWNLOAD_BASE}/{filename}"
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        data = resp.read()
+    with open(local_path, "wb") as f:
+        f.write(data)
+    return local_path
+
+def resolve_rule_pack(title_text, filename, parent=None, base_dir=None):
+    try:
+        path = download_rule_pack(filename, base_dir=base_dir)
+        return path, ""
+    except Exception as e:
+        path = get_sample_rule_pack_path(filename, base_dir=base_dir)
+        if not os.path.exists(path):
+            raise RuntimeError(f"{title_text} 下载失败: {e}") from e
+        if parent is not None:
+            InfoBar.warning("下载失败", f"{title_text} 下载失败，已回退使用本地缓存", parent=parent)
+        return path, str(e)
+
+def localize_file_dialog(dialog: QFileDialog):
+    dialog.setLabelText(QFileDialog.DialogLabel.LookIn, "查找范围:")
+    dialog.setLabelText(QFileDialog.DialogLabel.FileName, "文件名:")
+    dialog.setLabelText(QFileDialog.DialogLabel.FileType, "文件类型:")
+    dialog.setLabelText(QFileDialog.DialogLabel.Accept, "导入")
+    dialog.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
+
 class AddRuleDialog(MessageBoxBase):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -783,6 +959,392 @@ class LegacyMigrationDialog(MessageBoxBase):
     def selected_mode(self):
         return self.mode_combo.currentIndex()
 
+class ImportRulesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_path = ""
+        self.selected_source_name = ""
+
+        self.setWindowTitle("导入规则集")
+        self.setModal(True)
+        self.resize(860, 560)
+        self.setMinimumSize(760, 500)
+        if parent is not None:
+            self.setWindowIcon(parent.windowIcon())
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
+
+        title = TitleLabel("导入规则集")
+        setFont(title, 18, QFont.Weight.Bold)
+        root.addWidget(title)
+
+        desc = CaptionLabel("左侧可直接导入内置示例规则，右侧可浏览任意目录中的 JSON 规则文件")
+        desc.setTextColor(QColor(128, 128, 128))
+        root.addWidget(desc)
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        root.addLayout(content, 1)
+
+        left = CardWidget(self)
+        left.setFixedWidth(220)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(14, 14, 14, 14)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(StrongBodyLabel("通用规则"))
+        left_tip = CaptionLabel("点击左侧按钮会自动下载对应规则包到本地并直接导入")
+        left_tip.setWordWrap(True)
+        left_tip.setTextColor(QColor(128, 128, 128))
+        left_layout.addWidget(left_tip)
+        for title_text, filename in SAMPLE_RULE_PACKS:
+            btn = PushButton(FIF.DOCUMENT, title_text)
+            btn.clicked.connect(lambda checked=False, t=title_text, fn=filename: self._choose_sample_rule(t, fn))
+            left_layout.addWidget(btn)
+        left_layout.addStretch()
+        content.addWidget(left)
+
+        right = CardWidget(self)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(8)
+        self.file_dialog = QFileDialog(self, "选择规则文件")
+        self.file_dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self.file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        self.file_dialog.setNameFilter("JSON 文件 (*.json)")
+        self.file_dialog.setDirectory(app_root_dir())
+        localize_file_dialog(self.file_dialog)
+        self.file_dialog.accepted.connect(self._choose_file_rule)
+        right_layout.addWidget(self.file_dialog)
+        content.addWidget(right, 1)
+
+    def _choose_sample_rule(self, title_text, filename):
+        base_dir = getattr(self.parent(), "config_dir", None)
+        try:
+            path, _ = resolve_rule_pack(title_text, filename, parent=self, base_dir=base_dir)
+        except Exception as e:
+            InfoBar.error("导入失败", str(e), parent=self)
+            return
+        self.selected_path = path
+        self.selected_source_name = title_text
+        self.accept()
+
+    def _choose_file_rule(self):
+        files = self.file_dialog.selectedFiles()
+        path = files[0] if files else ""
+        if not path:
+            InfoBar.warning("提示", "请先选择一个 JSON 规则文件", parent=self)
+            return
+        self.selected_path = path
+        self.selected_source_name = "外部规则集"
+        self.accept()
+
+class RulePackManagerDialog(MessageBoxBase):
+    def __init__(self, main_win, store_items, parent=None):
+        super().__init__(main_win if main_win is not None else parent)
+        self.main_win = main_win
+        self.store_items = list(store_items or [])
+        self.setWindowTitle("规则包管理")
+        self.widget.setMinimumWidth(900)
+        self.widget.setMinimumHeight(560)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
+        title_icon = IconWidget(FIF.DOCUMENT)
+        title_icon.setFixedSize(22, 22)
+        title_row.addWidget(title_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        title = TitleLabel("规则包管理")
+        setFont(title, 18, QFont.Weight.Bold)
+        title_row.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addStretch()
+
+        btn_close = ToolButton(FIF.CLOSE, self)
+        btn_close.setFixedSize(30, 30)
+        btn_close.setToolTip("关闭")
+        btn_close.clicked.connect(self.reject)
+        title_row.addWidget(btn_close, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.viewLayout.addLayout(title_row)
+
+        desc = CaptionLabel("管理已下载到本地缓存目录中的规则包文件")
+        desc.setTextColor(QColor(128, 128, 128))
+        desc.setWordWrap(True)
+        self.viewLayout.addWidget(desc)
+        self.viewLayout.addSpacing(6)
+
+        body = QWidget(self)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(12)
+
+        self.lbl_pack_dir = CaptionLabel("")
+        self.lbl_pack_dir.setTextColor(QColor(128, 128, 128))
+        self.lbl_pack_dir.setWordWrap(True)
+        body_layout.addWidget(self.lbl_pack_dir)
+
+        self.tbl_cache = TableWidget()
+        self.tbl_cache.setColumnCount(4)
+        self.tbl_cache.setHorizontalHeaderLabels(["名称", "文件名", "大小", "路径"])
+        self.tbl_cache.verticalHeader().setVisible(False)
+        self.tbl_cache.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl_cache.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl_cache.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_cache.setColumnWidth(0, 220)
+        self.tbl_cache.setColumnWidth(1, 220)
+        self.tbl_cache.setColumnWidth(2, 100)
+        self.tbl_cache.setColumnHidden(3, True)
+        self.tbl_cache.horizontalHeader().setStretchLastSection(True)
+        self.tbl_cache.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tbl_cache.customContextMenuRequested.connect(lambda p: make_ctx(self, self.tbl_cache, p, 3))
+        style_table(self.tbl_cache)
+        body_layout.addWidget(self.tbl_cache, 1)
+
+        btn_bar = QWidget(body)
+        btn_row = QHBoxLayout(btn_bar)
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+        btn_refresh = PrimaryPushButton(FIF.SYNC, "刷新缓存")
+        btn_refresh.clicked.connect(self._refresh_cache_table)
+        btn_row.addWidget(btn_refresh)
+        btn_open_dir = PushButton(FIF.FOLDER, "打开目录")
+        btn_open_dir.clicked.connect(self._open_rule_pack_dir)
+        btn_row.addWidget(btn_open_dir)
+        btn_del_selected = PushButton(FIF.DELETE, "删除选中")
+        btn_del_selected.clicked.connect(self._delete_selected_cache)
+        btn_row.addWidget(btn_del_selected)
+        btn_clear_all = PushButton(FIF.CANCEL, "清空缓存")
+        btn_clear_all.clicked.connect(self._clear_all_cache)
+        btn_row.addWidget(btn_clear_all)
+        btn_row.addStretch()
+        body_layout.addWidget(btn_bar)
+        self.viewLayout.addWidget(body)
+        self.yesButton.hide()
+        self.cancelButton.hide()
+        footer = self.cancelButton.parentWidget()
+        if footer is not None and footer is not self and footer is not self.widget:
+            footer.hide()
+            footer.setFixedHeight(0)
+
+        self._refresh_cache_table(show_empty_tip=False)
+
+    def _rule_pack_dir(self):
+        return get_rule_pack_cache_dir(self.main_win.config_dir)
+
+    def _refresh_cache_table(self, show_empty_tip=True):
+        pack_dir = self._rule_pack_dir()
+        self.lbl_pack_dir.setText(f"缓存目录：{display_path(pack_dir)}")
+        self.lbl_pack_dir.setToolTip(display_path(pack_dir))
+
+        records = list_rule_pack_cache_records(self.store_items, pack_dir)
+        self.tbl_cache.setRowCount(len(records))
+        for row, item in enumerate(records):
+            self.tbl_cache.setItem(row, 0, QTableWidgetItem(item["title"]))
+            self.tbl_cache.setItem(row, 1, QTableWidgetItem(item["filename"]))
+            size_item = QTableWidgetItem(human_size(item["size"]))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.tbl_cache.setItem(row, 2, size_item)
+            self.tbl_cache.setItem(row, 3, QTableWidgetItem(item["path"]))
+
+        if show_empty_tip and not records:
+            InfoBar.warning("提示", "当前没有已缓存的规则包", parent=self.main_win)
+
+    def _open_rule_pack_dir(self):
+        pack_dir = self._rule_pack_dir()
+        os.makedirs(pack_dir, exist_ok=True)
+        open_explorer(pack_dir)
+
+    def _delete_selected_cache(self):
+        row = self.tbl_cache.currentRow()
+        path_item = self.tbl_cache.item(row, 3) if row >= 0 else None
+        path = path_item.text() if path_item else ""
+        if not path:
+            InfoBar.warning("提示", "请先选择一个已下载的规则包", parent=self.main_win)
+            return
+        if not MessageBox("确认", f"确定删除该规则包缓存？\n{display_path(path)}", self.main_win).exec():
+            return
+        try:
+            os.remove(path)
+            self._refresh_cache_table(show_empty_tip=False)
+            InfoBar.success("已删除", "规则包缓存已删除", parent=self.main_win)
+        except Exception as e:
+            InfoBar.error("删除失败", str(e), parent=self.main_win)
+
+    def _clear_all_cache(self):
+        records = list_rule_pack_cache_records(self.store_items, self._rule_pack_dir())
+        if not records:
+            InfoBar.warning("提示", "当前没有可清理的规则包缓存", parent=self.main_win)
+            return
+        if not MessageBox("确认", f"确定清空这 {len(records)} 个规则包缓存？", self.main_win).exec():
+            return
+        ok = 0
+        fl = 0
+        for item in records:
+            try:
+                os.remove(item["path"])
+                ok += 1
+            except Exception:
+                fl += 1
+        self._refresh_cache_table(show_empty_tip=False)
+        if fl == 0:
+            InfoBar.success("清理完成", f"已清理 {ok} 个规则包缓存", parent=self.main_win)
+        else:
+            InfoBar.warning("部分完成", f"已清理 {ok} 个，失败 {fl} 个", parent=self.main_win)
+
+class RuleStorePage(ScrollArea):
+    def __init__(self, main_win, parent=None):
+        super().__init__(parent)
+        self.main_win = main_win
+        self.selected_item = None
+        self.store_items = []
+
+        self.view = QWidget()
+        self.setWidget(self.view)
+        self.setWidgetResizable(True)
+        self.setObjectName("ruleStorePage")
+        self.enableTransparentBackground()
+
+        root = QVBoxLayout(self.view)
+        root.setContentsMargins(28, 12, 28, 20)
+        root.setSpacing(12)
+        title_row = make_title_row(FIF.DOCUMENT, "规则商店")
+        self.btn_refresh = PushButton(FIF.SYNC, "刷新列表")
+        self.btn_refresh.clicked.connect(self._refresh_items)
+        title_row.addWidget(self.btn_refresh)
+        self.btn_manage = PushButton(FIF.FOLDER, "规则包管理")
+        self.btn_manage.clicked.connect(self._open_pack_manager)
+        title_row.addWidget(self.btn_manage)
+        root.addLayout(title_row)
+
+        self.desc = CaptionLabel("从远程规则源选择规则包，一键下载并导入到当前自定义规则列表")
+        self.desc.setTextColor(QColor(128, 128, 128))
+        self.desc.setWordWrap(True)
+        root.addWidget(self.desc)
+
+        content = QHBoxLayout()
+        content.setSpacing(12)
+        root.addLayout(content, 1)
+
+        left = CardWidget(self.view)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(StrongBodyLabel("可用规则包"))
+
+        self.tbl = TableWidget()
+        self.tbl.setColumnCount(4)
+        self.tbl.setHorizontalHeaderLabels(["名称", "来源", "说明", "文件名"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setColumnHidden(3, True)
+        self.tbl.setColumnWidth(0, 180)
+        self.tbl.setColumnWidth(1, 100)
+        self.tbl.setColumnWidth(2, 280)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        style_table(self.tbl)
+        self.tbl.itemSelectionChanged.connect(self._sync_detail)
+        self.tbl.itemDoubleClicked.connect(lambda _: self._confirm_selection())
+        left_layout.addWidget(self.tbl, 1)
+        content.addWidget(left, 3)
+
+        right = CardWidget(self.view)
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(10)
+        right_layout.addWidget(StrongBodyLabel("规则详情"))
+
+        self.lbl_name = TitleLabel("")
+        setFont(self.lbl_name, 16, QFont.Weight.Bold)
+        right_layout.addWidget(self.lbl_name)
+
+        self.lbl_meta = CaptionLabel("")
+        self.lbl_meta.setTextColor(QColor(128, 128, 128))
+        self.lbl_meta.setWordWrap(True)
+        right_layout.addWidget(self.lbl_meta)
+
+        self.lbl_detail = CaptionLabel("")
+        self.lbl_detail.setWordWrap(True)
+        self.lbl_detail.setTextColor(QColor(128, 128, 128))
+        right_layout.addWidget(self.lbl_detail)
+        right_layout.addStretch()
+
+        self.btn_import = PrimaryPushButton(FIF.DOCUMENT, "下载并导入")
+        self.btn_import.clicked.connect(self._confirm_selection)
+        right_layout.addWidget(self.btn_import)
+        content.addWidget(right, 2)
+
+        self._load_items()
+
+    def _load_items(self, notify=False):
+        items, err = load_rule_store_items()
+        if not err:
+            self.store_items = items
+        self.desc.setText(
+            "从远程规则源选择规则包，一键下载并导入到当前自定义规则列表"
+            if not err else err
+        )
+        self.tbl.setRowCount(len(items))
+        for row, item in enumerate(items):
+            name_item = QTableWidgetItem(item["title"])
+            name_item.setData(Qt.ItemDataRole.UserRole, item)
+            self.tbl.setItem(row, 0, name_item)
+            self.tbl.setItem(row, 1, QTableWidgetItem(item["source"]))
+            self.tbl.setItem(row, 2, QTableWidgetItem(item["summary"]))
+            self.tbl.setItem(row, 3, QTableWidgetItem(item["filename"]))
+        if self.tbl.rowCount() > 0:
+            self.tbl.selectRow(0)
+            self._sync_detail()
+        else:
+            self._sync_detail()
+
+        if notify:
+            if err:
+                InfoBar.error("刷新失败", err, parent=self.main_win)
+            else:
+                InfoBar.success("刷新成功", f"已加载 {len(items)} 个规则包", parent=self.main_win)
+
+    def _refresh_items(self):
+        self._load_items(notify=True)
+
+    def _open_pack_manager(self):
+        dialog = RulePackManagerDialog(self.main_win, self.store_items, self)
+        dialog.exec()
+
+    def _sync_detail(self):
+        row = self.tbl.currentRow()
+        if row < 0:
+            self.selected_item = None
+            self.lbl_name.setText("未选择规则包")
+            self.lbl_meta.setText("")
+            self.lbl_detail.setText("请先从左侧选择一个规则包。")
+            self.btn_import.setEnabled(False)
+            return
+        item = self.tbl.item(row, 0)
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        self.selected_item = data if isinstance(data, dict) else None
+        if not self.selected_item:
+            return
+        self.lbl_name.setText(self.selected_item["title"])
+        self.lbl_meta.setText(f"来源：{self.selected_item['source']}\n文件：{self.selected_item['filename']}")
+        self.lbl_detail.setText(self.selected_item["detail"])
+        self.btn_import.setEnabled(True)
+
+    def _confirm_selection(self):
+        if not self.selected_item:
+            InfoBar.warning("提示", "请先选择一个规则包", parent=self.main_win)
+            return
+        title_text = self.selected_item["title"]
+        filename = self.selected_item["filename"]
+        try:
+            path, _ = resolve_rule_pack(title_text, filename, parent=self.main_win, base_dir=self.main_win.config_dir)
+        except Exception as e:
+            InfoBar.error("导入失败", str(e), parent=self.main_win)
+            return
+        self.main_win.import_rules_from_path(path, title_text)
+
 # ══════════════════════════════════════════════════════════
 #  页面：全局设置 (SettingPage)
 # ══════════════════════════════════════════════════════════
@@ -805,7 +1367,7 @@ class SettingPage(ScrollArea):
             lbl = CaptionLabel(text)
             setFont(lbl, 12, QFont.Weight.Medium) #灰色小字体大小
             lbl.setTextColor(QColor(128, 128, 128))
-            v.addSpacing(9) #灰色小字体上方留白
+            v.addSpacing(10) #灰色小字体上方留白
             v.addWidget(lbl)
 
         _add_category_label("基础设置")
@@ -868,24 +1430,7 @@ class SettingPage(ScrollArea):
         v.addWidget(card_cache)
 
         _add_category_label("配置")
-        # 4. 恢复默认配置卡片
-        card_reset = CardWidget(self.view)
-        cv_reset = QVBoxLayout(card_reset)
-        h_reset = QHBoxLayout()
-        text_v_reset = QVBoxLayout(); text_v_reset.setSpacing(2)
-        lbl_reset1 = StrongBodyLabel("恢复默认配置")
-        _smooth_title_font(lbl_reset1)
-        lbl_reset2 = CaptionLabel("将常规清理的勾选项、拖拽排序恢复为初始状态，并清除所有自定义规则")
-        lbl_reset2.setTextColor(QColor(128, 128, 128))
-        text_v_reset.addWidget(lbl_reset1); text_v_reset.addWidget(lbl_reset2)
-        h_reset.addLayout(text_v_reset); h_reset.addStretch()
-        
-        btn_reset = PushButton(FIF.UPDATE, "恢复")
-        btn_reset.clicked.connect(self._reset_defaults)
-        h_reset.addWidget(btn_reset)
-        cv_reset.addLayout(h_reset)
-        v.addWidget(card_reset)
-        # 5. 迁移旧版配置卡片
+        # 4. 迁移旧版配置卡片
         card_migrate = CardWidget(self.view)
         cv_migrate = QVBoxLayout(card_migrate)
         h_migrate = QHBoxLayout()
@@ -902,6 +1447,24 @@ class SettingPage(ScrollArea):
         h_migrate.addWidget(btn_migrate)
         cv_migrate.addLayout(h_migrate)
         v.addWidget(card_migrate)
+
+        # 5. 恢复默认配置卡片
+        card_reset = CardWidget(self.view)
+        cv_reset = QVBoxLayout(card_reset)
+        h_reset = QHBoxLayout()
+        text_v_reset = QVBoxLayout(); text_v_reset.setSpacing(2)
+        lbl_reset1 = StrongBodyLabel("恢复默认配置")
+        _smooth_title_font(lbl_reset1)
+        lbl_reset2 = CaptionLabel("将常规清理的勾选项、拖拽排序恢复为初始状态，并清除所有自定义规则")
+        lbl_reset2.setTextColor(QColor(128, 128, 128))
+        text_v_reset.addWidget(lbl_reset1); text_v_reset.addWidget(lbl_reset2)
+        h_reset.addLayout(text_v_reset); h_reset.addStretch()
+        
+        btn_reset = PushButton(FIF.UPDATE, "恢复")
+        btn_reset.clicked.connect(self._reset_defaults)
+        h_reset.addWidget(btn_reset)
+        cv_reset.addLayout(h_reset)
+        v.addWidget(card_reset)
 
         # 6. 配置目录卡片
         card_cfg_dir = CardWidget(self.view)
@@ -947,6 +1510,24 @@ class SettingPage(ScrollArea):
         cv_update.addLayout(h_update)
         v.addWidget(card_update)
 
+        # 8. 手动检查更新卡片
+        card_check_update = CardWidget(self.view)
+        cv_check_update = QVBoxLayout(card_check_update)
+        h_check_update = QHBoxLayout()
+        text_v_check_update = QVBoxLayout(); text_v_check_update.setSpacing(2)
+        lbl_check1 = StrongBodyLabel("检查更新")
+        _smooth_title_font(lbl_check1)
+        self.lbl_latest_version = CaptionLabel("最新版本：获取中...")
+        self.lbl_latest_version.setTextColor(QColor(128, 128, 128))
+        text_v_check_update.addWidget(lbl_check1); text_v_check_update.addWidget(self.lbl_latest_version)
+        h_check_update.addLayout(text_v_check_update); h_check_update.addStretch()
+
+        btn_check_update = PushButton(FIF.SYNC, "检查")
+        btn_check_update.clicked.connect(self._check_update_now)
+        h_check_update.addWidget(btn_check_update)
+        cv_check_update.addLayout(h_check_update)
+        v.addWidget(card_check_update)
+
         v.addStretch()
 
     def _on_auto_save_changed(self, is_checked):
@@ -991,6 +1572,14 @@ class SettingPage(ScrollArea):
     def _on_update_channel_changed(self, _):
         self.main_win.global_settings["update_channel"] = "beta" if self.cb_update_channel.currentIndex() == 1 else "stable"
         self.main_win.save_global_settings()
+        self.set_latest_version_text("最新版本：获取中...")
+        self.main_win.check_updates(manual=False)
+
+    def _check_update_now(self):
+        self.main_win.check_updates(manual=True)
+
+    def set_latest_version_text(self, text):
+        self.lbl_latest_version.setText(text)
 
     def _refresh_cache(self):
         try:
@@ -1265,28 +1854,52 @@ class CleanPage(ScrollArea):
             with open(path, 'w', encoding='utf-8') as f: json.dump(customs, f, ensure_ascii=False, indent=2)
             InfoBar.success("导出成功", f"规则已保存至: {path}", parent=self.window())
 
+    def import_rules_from_path(self, path, source_name="规则集"):
+        if not path or not os.path.exists(path):
+            InfoBar.error("导入失败", f"未找到 {source_name}: {display_path(path)}", parent=self.window())
+            return False
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                rules = json.load(f)
+            added = 0
+            skipped = 0
+            for r_data in rules:
+                if len(r_data) >= 5:
+                    nm, pa, tp, en, nt = r_data[0], r_data[1], r_data[2], r_data[3], r_data[4]
+                    if any(t[0] == nm and t[1] == pa for t in self.targets):
+                        skipped += 1
+                        continue
+                    self.targets.append((nm, pa, tp, en, nt, True))
+                    r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
+                    name_item = QTableWidgetItem(nm + " (自定义)")
+                    name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, True))
+                    
+                    self.tbl.setItem(r, 0, make_check_item(en)); self.tbl.setItem(r, 1, name_item)
+                    self.tbl.setItem(r, 2, QTableWidgetItem(pa)); self.tbl.setItem(r, 3, QTableWidgetItem(nt)); self.tbl.setItem(r, 4, QTableWidgetItem(""))
+                    added += 1
+            if added > 0:
+                self.save_custom_rules()
+                msg = f"{source_name} 已导入 {added} 条规则"
+                if skipped > 0:
+                    msg += f"，跳过 {skipped} 条重复规则"
+                InfoBar.success("导入成功", msg, parent=self.window())
+                return True
+            else:
+                InfoBar.warning("提示", f"{source_name} 未导入任何规则（可能全部重复）", parent=self.window())
+                return False
+        except Exception as e:
+            InfoBar.error("导入失败", f"文件读取错误: {e}", parent=self.window())
+            return False
+
     def do_import_rules(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入规则集", "", "JSON 文件 (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入规则集",
+            app_root_dir(),
+            "JSON 文件 (*.json)"
+        )
         if path:
-            try:
-                with open(path, 'r', encoding='utf-8') as f: rules = json.load(f)
-                added = 0
-                for r_data in rules:
-                    if len(r_data) >= 5:
-                        nm, pa, tp, en, nt = r_data[0], r_data[1], r_data[2], r_data[3], r_data[4]
-                        if any(t[0] == nm and t[1] == pa for t in self.targets): continue
-                        self.targets.append((nm, pa, tp, en, nt, True))
-                        r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
-                        name_item = QTableWidgetItem(nm + " (自定义)")
-                        name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, True))
-                        
-                        self.tbl.setItem(r, 0, make_check_item(en)); self.tbl.setItem(r, 1, name_item)
-                        self.tbl.setItem(r, 2, QTableWidgetItem(pa)); self.tbl.setItem(r, 3, QTableWidgetItem(nt)); self.tbl.setItem(r, 4, QTableWidgetItem(""))
-                        added += 1
-                if added > 0:
-                    self.save_custom_rules(); InfoBar.success("导入成功", f"成功导入 {added} 条自定义规则", parent=self.window())
-                else: InfoBar.warning("提示", "未导入任何规则（可能存在重复）", parent=self.window())
-            except Exception as e: InfoBar.error("导入失败", f"文件读取错误: {e}", parent=self.window())
+            self.window().import_rules_from_path(path, "外部规则集")
 
     def do_est(self): 
         self.tbl.setDragEnabled(False) 
@@ -1460,12 +2073,12 @@ class UninstallPage(ScrollArea):
         search_layout.addStretch()
         v.addLayout(search_layout)
 
-        self.tbl=TableWidget(); self.tbl.setColumnCount(6)
-        self.tbl.setHorizontalHeaderLabels([" ","名称","版本","发布者","安装目录","隐藏卸载命令"])
+        self.tbl=TableWidget(); self.tbl.setColumnCount(7)
+        self.tbl.setHorizontalHeaderLabels([" ","分类","名称","版本","发布者","安装目录","隐藏卸载命令"])
         self.tbl.verticalHeader().setVisible(False); self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows); self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.horizontalHeader().setStretchLastSection(True)
-        self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,4))
-        self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 250); self.tbl.setColumnWidth(2, 100); self.tbl.setColumnWidth(3, 180); self.tbl.setColumnWidth(4, 350); self.tbl.setColumnHidden(5, True)
+        self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,5))
+        self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 70); self.tbl.setColumnWidth(2, 245); self.tbl.setColumnWidth(3, 100); self.tbl.setColumnWidth(4, 180); self.tbl.setColumnWidth(5, 300); self.tbl.setColumnHidden(6, True)
         style_table(self.tbl); v.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
@@ -1482,8 +2095,8 @@ class UninstallPage(ScrollArea):
     def _filter_table(self, text):
         search_str = text.lower()
         for r in range(self.tbl.rowCount()):
-            name = self.tbl.item(r, 1).text().lower()
-            publisher = self.tbl.item(r, 3).text().lower()
+            name = self.tbl.item(r, 2).text().lower()
+            publisher = self.tbl.item(r, 4).text().lower()
             match = search_str in name or search_str in publisher
             self.tbl.setRowHidden(r, not match)
 
@@ -1526,7 +2139,20 @@ class UninstallPage(ScrollArea):
                                     icon_path = d_icon.split(',')[0].strip(' "')
                                 
                                 reg = f"{'HKLM' if hkey==winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"
-                                software.append((disp, ver, pub, cmd, loc, reg, icon_path))
+                                meta = classify_uninstall_entry(disp, pub, loc, reg)
+                                software.append({
+                                    "name": disp,
+                                    "version": ver,
+                                    "publisher": pub,
+                                    "cmd": cmd,
+                                    "location": loc,
+                                    "reg": reg,
+                                    "icon_path": icon_path,
+                                    "category": meta["category"],
+                                    "is_risky": meta["is_risky"],
+                                    "risk_kind": meta["risk_kind"],
+                                    "risk_reason": meta["risk_reason"]
+                                })
                         except: 
                             pass
                         finally: 
@@ -1540,33 +2166,83 @@ class UninstallPage(ScrollArea):
         seen = set()
         unique = []
         for s in software:
-            if s[0] not in seen: 
-                seen.add(s[0])
+            dedupe_key = (s["name"], s["publisher"], s["location"])
+            if dedupe_key not in seen: 
+                seen.add(dedupe_key)
                 unique.append(s)
-                
-        unique.sort(key=lambda x: x[0].lower())
-        
-        for n, v, p, c, l, r, ic in unique: 
-            self.sig.uninst_add.emit(n, v, p, l, r, c, ic)
-            
-        self.sig.done.emit(f"成功扫描出 {len(unique)} 个软件，耗时 {time.time()-t0:.1f} 秒")
+
+        unique.sort(key=lambda x: (0 if x["category"] == "用户" else 1, x["name"].lower()))
+
+        user_count = 0
+        system_count = 0
+        for item in unique:
+            if item["category"] == "系统":
+                system_count += 1
+            else:
+                user_count += 1
+            self.sig.uninst_add.emit(item)
+
+        self.sig.done.emit(f"成功扫描出 {len(unique)} 个软件（用户 {user_count}，系统 {system_count}），耗时 {time.time()-t0:.1f} 秒")
 
     def _get_checked_rows_data(self):
         rows = []
         for r in range(self.tbl.rowCount()):
             if is_row_checked(self.tbl, r) and not self.tbl.isRowHidden(r):
-                nm = self.tbl.item(r, 1).text()
-                pub = self.tbl.item(r, 3).text()
-                loc = self.tbl.item(r, 4).text()
-                cmd = self.tbl.item(r, 5).text()
-                reg = self.tbl.item(r, 5).data(Qt.ItemDataRole.UserRole)
-                rows.append((r, nm, pub, loc, cmd, reg))
+                nm = self.tbl.item(r, 2).text()
+                pub = self.tbl.item(r, 4).text()
+                loc = self.tbl.item(r, 5).text()
+                hidden_item = self.tbl.item(r, 6)
+                cmd = hidden_item.text() if hidden_item else ""
+                reg = hidden_item.data(Qt.ItemDataRole.UserRole) if hidden_item else ""
+                meta = hidden_item.data(Qt.ItemDataRole.UserRole + 1) if hidden_item else {}
+                rows.append({
+                    "row": r,
+                    "name": nm,
+                    "publisher": pub,
+                    "location": loc,
+                    "cmd": cmd,
+                    "reg": reg,
+                    "category": meta.get("category", "用户"),
+                    "is_risky": bool(meta.get("is_risky", False)),
+                    "risk_kind": meta.get("risk_kind", ""),
+                    "risk_reason": meta.get("risk_reason", "")
+                })
         return rows
+
+    def _confirm_risky_selection(self, data, action_text):
+        risky_items = [item for item in data if item.get("is_risky")]
+        if not risky_items:
+            return True
+
+        system_items = [item for item in risky_items if item.get("risk_kind") == "system"]
+        impact_items = [item for item in risky_items if item.get("risk_kind") != "system"]
+        lines = ["本次勾选项目中包含高风险卸载项。"]
+
+        if system_items:
+            lines.append("")
+            lines.append(f"系统软件/组件：{len(system_items)} 项")
+            lines.extend(f"- {item['name']}" for item in system_items[:5])
+            if len(system_items) > 5:
+                lines.append(f"- 另有 {len(system_items) - 5} 项未展开")
+
+        if impact_items:
+            lines.append("")
+            lines.append(f"可能影响系统的软件：{len(impact_items)} 项")
+            lines.extend(f"- {item['name']}" for item in impact_items[:5])
+            if len(impact_items) > 5:
+                lines.append(f"- 另有 {len(impact_items) - 5} 项未展开")
+
+        lines.append("")
+        lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常。是否继续？")
+        return MessageBox("风险提示", "\n".join(lines), self.window()).exec()
 
     def do_std_uninstall(self):
         data = self._get_checked_rows_data()
         if not data:
             self.sig.log.emit("请先勾选至少一个要卸载的软件！"); return
+        if not self._confirm_risky_selection(data, "标准卸载"):
+            self.sig.log.emit("已取消高风险标准卸载操作")
+            return
         self.stop.clear()
         threading.Thread(target=self._std_uninstall_w, args=(data,), daemon=True).start()
 
@@ -1574,7 +2250,8 @@ class UninstallPage(ScrollArea):
         t0 = time.time()
         ok = fl = sk = 0
         tot = len(data)
-        for i, (r, nm, pub, loc, cmd, reg) in enumerate(data, 1):
+        for i, item in enumerate(data, 1):
+            r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; cmd = item["cmd"]; reg = item["reg"]
             if self.stop.is_set():
                 self.sig.done.emit(f"标准卸载已取消：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
                 return
@@ -1622,10 +2299,14 @@ class UninstallPage(ScrollArea):
         data = self._get_checked_rows_data()
         if not data:
             self.sig.log.emit("请先勾选目标软件！"); return
+        if not self._confirm_risky_selection(data, "强力卸载"):
+            self.sig.log.emit("已取消高风险强力卸载操作")
+            return
 
         all_files, all_regs = [], []
         chosen_apps = 0
-        for r, nm, pub, loc, cmd, reg in data:
+        for item in data:
+            r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; reg = item["reg"]
             picked = self._pick_leftovers(nm, pub, loc, reg)
             if picked is None:
                 continue
@@ -1780,11 +2461,6 @@ class BigFilePage(ScrollArea):
     def _on_disk_ready(self, dtype, threads): self._disk_type = dtype; self._disk_threads = threads; self.lbl_disk.setText(f"类型：{dtype}  线程：{threads}")
 
     def do_scan(self):
-        roots = [d for d, state in self.drive_states.items() if state]
-        if not roots:
-            return
-        self._disk_threads, self._disk_type = get_drive_scan_profile(roots)
-        self.lbl_disk.setText(f"类型：{self._disk_type}  线程：{self._disk_threads}")
         self.stop.clear(); self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
         threading.Thread(target=self._scan_w,daemon=True).start()
 
@@ -1794,12 +2470,12 @@ class BigFilePage(ScrollArea):
         roots = [d for d, state in self.drive_states.items() if state]
         if not roots: return
         self.sig.log.emit(f"扫描 (≥{mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
-        res = scan_big_files(roots, mb*1024*1024, DEFAULT_EXCLUDES, self.stop, lambda n: self.sig.prog.emit(n % 100, 100), workers=w, limit=mx)
+        res = scan_big_files(roots, mb*1024*1024, DEFAULT_EXCLUDES, self.stop, lambda n: self.sig.prog.emit(n % 100, 100), workers=w)
         if self.stop.is_set():
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
-        for sz,pa in res: self.sig.big_add.emit(str(sz), pa)
-        self.sig.done.emit(f"扫描完成，找到 {len(res)} 条，耗时 {time.time()-t0:.1f} 秒")
+        for sz,pa in res[:mx]: self.sig.big_add.emit(str(sz), pa)
+        self.sig.done.emit(f"扫描完成，找到 {len(res[:mx])} 条，耗时 {time.time()-t0:.1f} 秒")
 
     def do_del(self):
         paths=[self.tbl.item(r,3).text() for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r) and self.tbl.item(r,3)]
@@ -2296,14 +2972,16 @@ class MainWindow(FluentWindow):
                 
         self.stop = threading.Event(); self.sig = Sig()
         self.pg_clean = CleanPage(self.sig, self.targets, self.stop, self)
+        self.pg_rule_store = RuleStorePage(self, self)
         self.pg_big = BigFilePage(self.sig, self.stop, self)
         self.pg_uninstall = UninstallPage(self.sig, self.stop, self)
         self.pg_more = MoreCleanPage(self.sig, self.stop, self)
         self.pg_setting = SettingPage(self, self)
+        self._update_checking = False
         
         self._init_nav(); self._init_win(); self._conn()
         threading.Thread(target=self._async_detect, daemon=True).start()
-        threading.Timer(2.0, self._check_update_worker).start()
+        QTimer.singleShot(2000, lambda: self.check_updates(manual=False))
         self._pending_legacy_migration = self._should_offer_legacy_migration()
         if self._pending_legacy_migration:
             QTimer.singleShot(800, self._prompt_legacy_config_migration)
@@ -2502,6 +3180,10 @@ class MainWindow(FluentWindow):
                 json.dump(self.global_settings, f, ensure_ascii=False, indent=2)
         except: pass
 
+    def import_rules_from_path(self, path, source_name="规则集"):
+        if hasattr(self, "pg_clean") and self.pg_clean.import_rules_from_path(path, source_name):
+            self.switchTo(self.pg_clean)
+
     def closeEvent(self, event):
         if self.global_settings.get("auto_save", True):
             try:
@@ -2513,6 +3195,7 @@ class MainWindow(FluentWindow):
     def _init_nav(self):
         self.navigationInterface.setExpandWidth(200); self.navigationInterface.setCollapsible(True)
         self.addSubInterface(self.pg_clean, FIF.BROOM, "常规清理")
+        self.addSubInterface(self.pg_rule_store, FIF.DOCUMENT, "规则商店")
         self.addSubInterface(self.pg_big,   FIF.ZOOM,  "大文件扫描")
         self.addSubInterface(self.pg_uninstall, FIF.APPLICATION, "应用强力卸载")
         self.addSubInterface(self.pg_more,  FIF.MORE,  "更多清理")
@@ -2534,20 +3217,27 @@ class MainWindow(FluentWindow):
         self.sig.more_clr.connect(lambda: self.pg_more.tbl.setRowCount(0)); self.sig.more_add.connect(self._madd)
         self.sig.uninst_clr.connect(lambda: self.pg_uninstall.tbl.setRowCount(0)); self.sig.uninst_add.connect(self._uadd)
         self.sig.update_found.connect(self._show_update_dialog)
+        self.sig.update_status.connect(self._show_update_status)
+        self.sig.update_latest.connect(self.pg_setting.set_latest_version_text)
 
     def _async_detect(self):
         threads, dtype = get_scan_threads_cached("C"); self.sig.disk_ready.emit(dtype, threads)
 
-    def _check_update_worker(self):
-        try:
-            with urllib.request.urlopen(UPDATE_JSON_URL, timeout=8) as r:
-                raw_text = r.read().decode("utf-8")
-        except:
+    def check_updates(self, manual=False):
+        if self._update_checking:
+            if manual:
+                InfoBar.warning("请稍候", "正在检查更新，请稍后再试", parent=self)
             return
+        self._update_checking = True
+        threading.Thread(target=self._check_update_worker, args=(manual,), daemon=True).start()
+
+    def _get_latest_update(self):
+        with urllib.request.urlopen(UPDATE_JSON_URL, timeout=8) as r:
+            raw_text = r.read().decode("utf-8")
 
         payload = _load_update_payload(raw_text)
         if not payload:
-            return
+            raise ValueError("更新信息解析失败")
 
         def _extract_entries(obj):
             if isinstance(obj, list):
@@ -2570,7 +3260,6 @@ class MainWindow(FluentWindow):
             return []
 
         channel = self.global_settings.get("update_channel", "stable")
-        current_key = _version_key(CURRENT_VERSION)
         candidates = []
 
         for item in _extract_entries(payload):
@@ -2581,17 +3270,43 @@ class MainWindow(FluentWindow):
                 continue
             if channel == "stable" and (_is_prerelease(ver) or bool(item.get("prerelease", False))):
                 continue
-            if _version_key(ver) > current_key:
-                candidates.append((ver, url, changelog))
+            candidates.append((ver, url, changelog))
 
         if not candidates:
-            return
+            return None
 
-        latest = max(candidates, key=lambda x: _version_key(x[0]))
-        self.sig.update_found.emit(latest[0], latest[1], latest[2])
+        return max(candidates, key=lambda x: _version_key(x[0]))
+
+    def _check_update_worker(self, manual=False):
+        try:
+            latest = self._get_latest_update()
+            if latest:
+                self.sig.update_latest.emit(f"最新版本：v{latest[0]}")
+            else:
+                self.sig.update_latest.emit("最新版本：未获取到")
+
+            if latest and _version_key(latest[0]) > _version_key(CURRENT_VERSION):
+                self.sig.update_found.emit(latest[0], latest[1], latest[2])
+            elif manual:
+                channel_text = "测试版" if self.global_settings.get("update_channel", "stable") == "beta" else "稳定版"
+                self.sig.update_status.emit("success", "已是最新版本", f"当前 {channel_text} 通道没有发现比 v{CURRENT_VERSION} 更新的版本")
+        except Exception as e:
+            self.sig.update_latest.emit("最新版本：获取失败")
+            if manual:
+                self.sig.update_status.emit("error", "检查失败", f"无法获取更新信息: {e}")
+        finally:
+            self._update_checking = False
 
     def _show_update_dialog(self, version, url, changelog):
         if MessageBox(f"发现新版本 v{version}", f"更新内容：\n{changelog}\n\n是否立即前往下载？", self.window()).exec() and url: webbrowser.open(url)
+
+    def _show_update_status(self, level, title, content):
+        bar_fn = {
+            "success": InfoBar.success,
+            "warning": InfoBar.warning,
+            "error": InfoBar.error
+        }.get(level, InfoBar.success)
+        bar_fn(title, content, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=3500, parent=self)
 
     def _ts(self): return time.strftime("%H:%M:%S")
 
@@ -2622,9 +3337,20 @@ class MainWindow(FluentWindow):
         t.setItem(r, 0, make_check_item(chk)); t.setItem(r, 1, QTableWidgetItem(tp)); t.setItem(r, 2, QTableWidgetItem(nm))
         t.setItem(r, 3, QTableWidgetItem(det)); t.setItem(r, 4, QTableWidgetItem(pa))
 
-    def _uadd(self, nm, ver, pub, loc, reg, cmd, icon_path): 
+    def _uadd(self, item): 
         t=self.pg_uninstall.tbl; r=t.rowCount(); t.setRowCount(r+1)
-                  
+        nm = item.get("name", "")
+        ver = item.get("version", "")
+        pub = item.get("publisher", "")
+        loc = item.get("location", "")
+        reg = item.get("reg", "")
+        cmd = item.get("cmd", "")
+        icon_path = item.get("icon_path", "")
+        category = item.get("category", "用户")
+        is_risky = bool(item.get("is_risky", False))
+        risk_kind = item.get("risk_kind", "")
+        risk_reason = item.get("risk_reason", "")
+
         name_item = QTableWidgetItem(nm)
         if icon_path and os.path.exists(icon_path):
             provider = QFileIconProvider()
@@ -2634,12 +3360,40 @@ class MainWindow(FluentWindow):
         else:
             name_item.setIcon(FIF.APPLICATION.icon())
 
+        risk_tip = "普通项目"
+        if category == "系统":
+            risk_tip = f"高风险：系统组件\n{risk_reason}" if risk_reason else "高风险：系统组件"
+        elif is_risky:
+            risk_tip = f"高风险：可能影响系统或其他软件\n{risk_reason}" if risk_reason else "高风险：可能影响系统或其他软件"
+        elif risk_reason:
+            risk_tip = risk_reason
+
+        name_item.setToolTip(risk_tip)
+
+        category_item = QTableWidgetItem(category)
+        if category == "系统":
+            category_item.setForeground(QColor(196, 92, 32))
+        elif is_risky:
+            category_item.setForeground(QColor(180, 120, 0))
+        else:
+            category_item.setForeground(QColor(96, 96, 96))
+        category_item.setToolTip(risk_tip)
+
         t.setItem(r, 0, make_check_item(False))
-        t.setItem(r, 1, name_item) 
-        t.setItem(r, 2, QTableWidgetItem(ver))
-        t.setItem(r, 3, QTableWidgetItem(pub))
-        t.setItem(r, 4, QTableWidgetItem(loc))
-        hidden_item = QTableWidgetItem(cmd); hidden_item.setData(Qt.ItemDataRole.UserRole, reg); t.setItem(r, 5, hidden_item)
+        t.setItem(r, 1, category_item)
+        t.setItem(r, 2, name_item) 
+        t.setItem(r, 3, QTableWidgetItem(ver))
+        t.setItem(r, 4, QTableWidgetItem(pub))
+        t.setItem(r, 5, QTableWidgetItem(loc))
+        hidden_item = QTableWidgetItem(cmd)
+        hidden_item.setData(Qt.ItemDataRole.UserRole, reg)
+        hidden_item.setData(Qt.ItemDataRole.UserRole + 1, {
+            "category": category,
+            "is_risky": is_risky,
+            "risk_kind": risk_kind,
+            "risk_reason": risk_reason
+        })
+        t.setItem(r, 6, hidden_item)
 
     def _about(self):
         MessageBox("关于", f"C盘强力清理工具 v{CURRENT_VERSION}\nQQ交流群：670804369\nUI：Fluent Widgets\nby Kio",self).exec()
