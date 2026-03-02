@@ -36,3 +36,10 @@ error: failed to push some refs to 'https://github.com/Kiowx/c_cleaner_plus.git'
 [2026-03-02 15:42:23] 🔗 GitHub Actions 将自动触发 build.yml workflow
 [2026-03-02 15:42:23] ========== 流程结束 ==========
 [2026-03-02 15:42:23] 
+[2026-03-02 15:50:27] ========== 开始自动提交流程 ==========
+[2026-03-02 15:50:27] 正在拉取最新代码...
+error: cannot pull with rebase: You have unstaged changes.
+error: please commit or stash them.
+[2026-03-02 15:50:27] 📝 检测到以下文件变更：
+ M auto_commit.log
+[2026-03-02 15:50:27] 📦 正在添加所有变更（排除 workflows 目录）...
