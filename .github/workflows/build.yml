@@ -6,7 +6,11 @@ on:
   push:
     tags:
       - 'v*'
-  # 2. 允许在 GitHub 网页上纯手动点击触发
+    # 2. 每天自动提交时触发（main/master 分支）
+    branches:
+      - 'main'
+      - 'master'
+  # 3. 允许在 GitHub 网页上纯手动点击触发
   workflow_dispatch: 
     inputs:
       version_tag:
