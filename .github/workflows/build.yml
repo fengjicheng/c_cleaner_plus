@@ -79,19 +79,35 @@ jobs:
         # 如果最终文件不存在或为空，创建一个空文件防止后续步骤报错
         touch main_release_notes.txt
 
+        # 在最后一行追加 Markdown 分隔线
+        echo "" >> main_release_notes.txt
+        echo "---" >> main_release_notes.txt
+
         # 清理临时文件
         rm temp_log.txt
 
-    - name: 7. 自动创建 GitHub Release 并上传 (Create Release)
+    - name: 7. 智能判定版本号 (Determine version tag)
+      shell: bash
+      run: |
+        # 优先级：手动输入 > git tag 触发 > 自动生成时间戳 tag
+        if [ -n "${{ github.event.inputs.version_tag }}" ]; then
+          echo "RELEASE_TAG=${{ github.event.inputs.version_tag }}" >> $GITHUB_ENV
+        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+        else
+          echo "RELEASE_TAG=auto-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+        fi
+
+    - name: 8. 自动创建 GitHub Release 并上传 (Create Release)
       uses: softprops/action-gh-release@v2
       with:
         # 捕获 dist 目录下的所有 exe 文件
         files: dist/*.exe
-        # 智能命名：如果是手动触发就用输入框的版本号，如果是 push tag 触发就用 tag 名称
-        tag_name: ${{ github.event.inputs.version_tag || github.ref_name }}
+        # 使用第 7 步判定好的版本号
+        tag_name: ${{ env.RELEASE_TAG }}
         # 读取第 6 步动态生成的纯文本日志文件
         body_path: main_release_notes.txt
         # 自动检测版本号中是否包含 "alpha" 或 "beta"，如果包含则自动打上 Pre-release 标记
-        prerelease: ${{ contains(github.event.inputs.version_tag || github.ref_name, 'alpha') || contains(github.event.inputs.version_tag || github.ref_name, 'beta') }}
+        prerelease: ${{ contains(env.RELEASE_TAG, 'alpha') || contains(env.RELEASE_TAG, 'beta') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
