@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.2.9-alpha01
+C盘强力清理工具 v0.2.9-alpha02
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
 
-import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re
+import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq
 import urllib.request
 import webbrowser
 from collections import defaultdict
 
 from PySide6.QtCore import Qt, Signal, QObject, QPoint, QMetaObject, Slot, QFileInfo, QSize, QTimer
-from PySide6.QtGui import QFont, QIcon, QColor, QPainter, QDrag, QPixmap, QRegion
+from PySide6.QtGui import QFont, QIcon, QColor, QPainter, QDrag, QPixmap, QRegion, QTextCursor
 from qfluentwidgets import isDarkTheme, themeColor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.2.9-alpha01"
+CURRENT_VERSION = "0.2.9-alpha02"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -323,12 +323,52 @@ def safe_getsize(p):
     try: return os.path.getsize(p)
     except: return 0
 
-def dir_size(path):
+def dir_size(path, stop_flag=None):
     t=0
     for r,ds,fs in os.walk(path,topdown=True):
+        if stop_flag is not None and stop_flag.is_set():
+            break
         ds[:]=[d for d in ds if not os.path.islink(os.path.join(r,d))]
-        for f in fs: t+=safe_getsize(os.path.join(r,f))
+        for f in fs:
+            if stop_flag is not None and stop_flag.is_set():
+                break
+            t+=safe_getsize(os.path.join(r,f))
     return t
+
+def estimate_rule_size(entry, stop_flag=None):
+    import fnmatch
+
+    parsed = parse_rule_entry(entry)
+    if not parsed:
+        return 0
+
+    nm, pa, tp, _, nt, _, pattern = parsed
+    _ = nm
+    if stop_flag is not None and stop_flag.is_set():
+        return 0
+
+    try:
+        if tp == "dir":
+            target = expand_env(pa)
+            return dir_size(target, stop_flag=stop_flag) if os.path.isdir(target) else 0
+        if tp == "glob":
+            target = expand_env(pa)
+            if not os.path.isdir(target):
+                return 0
+            rule_pattern = normalize_rule_pattern(tp, pattern, nt)
+            total = 0
+            for name in os.listdir(target):
+                if stop_flag is not None and stop_flag.is_set():
+                    break
+                if fnmatch.fnmatch(name.lower(), rule_pattern.lower()):
+                    total += safe_getsize(os.path.join(target, name))
+            return total
+        if tp == "file":
+            target = expand_env(pa)
+            return safe_getsize(target) if os.path.isfile(target) else 0
+    except:
+        return 0
+    return 0
 
 def delete_path(path, perm, log_fn):
     import shutil
@@ -431,7 +471,48 @@ def kill_app_processes(install_dir, log_fn):
 # ══════════════════════════════════════════════════════════
 CACHE_FILE = os.path.join(os.environ.get("TEMP", "."), "cdisk_cleaner_cache.json")
 
+def _normalize_drive_letter(drive_letter="C"):
+    text = str(drive_letter or "").strip()
+    if not text:
+        return "C"
+    drive = os.path.splitdrive(text)[0] or text
+    drive = drive.rstrip("\\/ ")
+    if drive.endswith(":"):
+        drive = drive[:-1]
+    return (drive[:1] or "C").upper()
+
+def _load_scan_cache():
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return {}
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        drives = raw.get("drives")
+        if isinstance(drives, dict):
+            return drives
+        if "threads" in raw and "dtype" in raw:
+            return {
+                "C": {
+                    "threads": raw.get("threads", 4),
+                    "dtype": raw.get("dtype", "Unknown"),
+                    "ts": raw.get("ts", 0)
+                }
+            }
+    except:
+        pass
+    return {}
+
+def _save_scan_cache(drives):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"drives": drives}, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
 def detect_disk_type(drive_letter="C"):
+    drive_letter = _normalize_drive_letter(drive_letter)
     try:
         ps_script = f"""
 $partition = Get-Partition -DriveLetter {drive_letter} -ErrorAction SilentlyContinue
@@ -453,17 +534,50 @@ def get_scan_threads(drive_letter="C"):
     return {"SSD": 12, "HDD": 2, "Unknown": 4}.get(dtype, 4), dtype
 
 def get_scan_threads_cached(drive_letter="C"):
+    drive_letter = _normalize_drive_letter(drive_letter)
     try:
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            if time.time() - cache.get("ts", 0) < 86400:
-                return cache["threads"], cache["dtype"]
-    except: pass
+        drives = _load_scan_cache()
+        cache = drives.get(drive_letter, {})
+        if time.time() - cache.get("ts", 0) < 86400:
+            return cache.get("threads", 4), cache.get("dtype", "Unknown")
+    except:
+        pass
     threads, dtype = get_scan_threads(drive_letter)
     try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f: json.dump({"threads": threads, "dtype": dtype, "ts": time.time()}, f)
-    except: pass
+        drives = _load_scan_cache()
+        drives[drive_letter] = {"threads": threads, "dtype": dtype, "ts": time.time()}
+        _save_scan_cache(drives)
+    except:
+        pass
+    return threads, dtype
+
+def get_scan_threads_for_drives_cached(drives):
+    letters = []
+    seen = set()
+    for drive in drives or []:
+        letter = _normalize_drive_letter(drive)
+        if letter not in seen:
+            seen.add(letter)
+            letters.append(letter)
+
+    if not letters:
+        return 4, "Unknown"
+
+    stats = [get_scan_threads_cached(letter) for letter in letters]
+    if len(stats) == 1:
+        return stats[0]
+
+    dtypes = [dtype for _, dtype in stats]
+    total_threads = sum(threads for threads, _ in stats)
+    threads = min(24, max(max(threads for threads, _ in stats), total_threads))
+
+    if len(set(dtypes)) == 1:
+        dtype = dtypes[0]
+    elif "SSD" in dtypes and "HDD" in dtypes:
+        dtype = "Mixed"
+    else:
+        dtype = "/".join(sorted(set(dtypes)))
+
     return threads, dtype
 
 # ══════════════════════════════════════════════════════════
@@ -521,24 +635,66 @@ def default_clean_targets():
 
 DEFAULT_EXCLUDES=[r"C:\Windows\WinSxS",r"C:\Windows\Installer",r"C:\Program Files",r"C:\Program Files (x86)"]
 BIGFILE_SKIP_EXT={".sys"}
+BIGFILE_OPTIONAL_SKIP_NAMES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "memory.dmp"}
+BIGFILE_OPTIONAL_SKIP_EXT = {
+    ".vhd", ".vhdx", ".avhd", ".avhdx", ".vmdk", ".vdi", ".qcow", ".qcow2", ".ova", ".ovf"
+}
+LOG_MAX_LINES = 1000
 
 def should_exclude(p, prefixes):
-    n=os.path.normcase(os.path.abspath(p))
-    return any(n.startswith(os.path.normcase(os.path.abspath(e))) for e in prefixes)
+    n = os.path.normcase(os.path.abspath(p))
+    for e in prefixes:
+        if not e:
+            continue
+        candidate = os.path.normcase(os.path.abspath(e))
+        try:
+            if os.path.commonpath([n, candidate]) == candidate:
+                return True
+        except ValueError:
+            continue
+    return False
 
 # ══════════════════════════════════════════════════════════
 #  多线程文件扫描
 # ══════════════════════════════════════════════════════════
 _SENTINEL = None
 
-def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock):
-    while not stop_flag.is_set():
+def _push_bigfile_result(results, item, result_limit):
+    if result_limit and result_limit > 0:
+        if len(results) < result_limit:
+            heapq.heappush(results, item)
+        elif item[0] > results[0][0]:
+            heapq.heapreplace(results, item)
+    else:
+        results.append(item)
+
+def should_skip_bigfile(path, skip_optional=False):
+    name = os.path.basename(path).lower()
+    ext = os.path.splitext(name)[1]
+    if ext in BIGFILE_SKIP_EXT:
+        return True
+    if not skip_optional:
+        return False
+    if name in BIGFILE_OPTIONAL_SKIP_NAMES:
+        return True
+    if ext in BIGFILE_OPTIONAL_SKIP_EXT:
+        return True
+    return False
+
+def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock, result_limit=None, skip_optional=False):
+    while True:
         try: dirpath = dir_queue.get(timeout=0.05)
         except queue.Empty: continue
-        if dirpath is _SENTINEL: dir_queue.put(_SENTINEL); break
+        if dirpath is _SENTINEL:
+            dir_queue.task_done()
+            break
+        if stop_flag.is_set():
+            dir_queue.task_done()
+            continue
         try: entries = os.scandir(dirpath)
         except: dir_queue.task_done(); continue
-        local_res = []; local_count = 0
+        local_count = 0
+        local_results = []
         try:
             for entry in entries:
                 if stop_flag.is_set(): break
@@ -547,43 +703,70 @@ def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock):
                     if entry.is_dir(follow_symlinks=False):
                         if not should_exclude(entry.path, excl): dir_queue.put(entry.path)
                     elif entry.is_file(follow_symlinks=False):
-                        if os.path.splitext(entry.name)[1].lower() in BIGFILE_SKIP_EXT: continue
-                        st = entry.stat(follow_symlinks=False); local_count += 1
-                        if st.st_size >= min_b: local_res.append((st.st_size, entry.path))
+                        if should_skip_bigfile(entry.path, skip_optional=skip_optional): continue
+                        st = entry.stat(follow_symlinks=False)
+                        local_count += 1
+                        if st.st_size >= min_b:
+                            _push_bigfile_result(local_results, (st.st_size, entry.path), result_limit)
                 except: pass
         finally:
             try: entries.close()
             except: pass
-        if local_res or local_count:
-            with lock: results.extend(local_res); counter[0] += local_count
+        if local_count or local_results:
+            with lock:
+                counter[0] += local_count
+                if result_limit and result_limit > 0:
+                    for item in local_results:
+                        _push_bigfile_result(results, item, result_limit)
+                else:
+                    results.extend(local_results)
         dir_queue.task_done()
 
-def scan_big_files(roots, min_b, excl, stop, cb, workers=4):
+def scan_big_files(roots, min_b, excl, stop, workers=4, result_limit=None, progress_cb=None, skip_optional=False):
     dir_queue = queue.Queue(); results = []; counter = [0]; lock = threading.Lock()
     for root in roots: dir_queue.put(root)
     threads = []
     for _ in range(workers):
-        t = threading.Thread(target=_dir_worker, args=(dir_queue, min_b, excl, stop, results, counter, lock), daemon=True)
+        t = threading.Thread(
+            target=_dir_worker,
+            args=(dir_queue, min_b, excl, stop, results, counter, lock, result_limit, skip_optional),
+            daemon=True
+        )
         t.start(); threads.append(t)
-    tk = time.time()
-    while not stop.is_set():
-        try:
-            dir_queue.all_tasks_done.acquire()
-            if dir_queue.unfinished_tasks == 0: dir_queue.all_tasks_done.release(); break
-            dir_queue.all_tasks_done.release()
-        except: pass
+    join_done = threading.Event()
+    threading.Thread(target=lambda: (dir_queue.join(), join_done.set()), daemon=True).start()
+    last_report = 0.0
+    sent_stop_signal = False
+
+    while not join_done.wait(0.1):
         now = time.time()
-        if now - tk >= 0.3: cb(counter[0]); tk = now
-        time.sleep(0.05)
-    dir_queue.put(_SENTINEL)
-    for t in threads: t.join(timeout=2)
-    cb(counter[0])
-    results.sort(reverse=True, key=lambda x: x[0])
+        if progress_cb and now - last_report >= 0.3:
+            with lock:
+                scanned = counter[0]
+            progress_cb(scanned)
+            last_report = now
+        if stop.is_set() and not sent_stop_signal:
+            for _ in threads:
+                dir_queue.put(_SENTINEL)
+            sent_stop_signal = True
+
+    if not sent_stop_signal:
+        for _ in threads:
+            dir_queue.put(_SENTINEL)
+    for t in threads:
+        t.join(timeout=2)
+    results.sort(key=lambda x: (-x[0], os.path.normcase(x[1])))
+    if progress_cb:
+        with lock:
+            scanned = counter[0]
+        progress_cb(scanned)
     return results
 
 class Sig(QObject):
-    log=Signal(str); prog=Signal(int,int); est=Signal(int,int)
+    log=Signal(str); prog=Signal(int,int); est=Signal(int, object)
     big_clr=Signal(); big_add=Signal(str,str); done=Signal(str)
+    big_prog=Signal(int,int); big_done=Signal(str, str)
+    big_scan_count=Signal(int)
     disk_ready=Signal(str,int); update_found=Signal(str, str, str)
     update_status=Signal(str, str, str)
     update_latest=Signal(str)
@@ -595,6 +778,23 @@ def style_table(tbl: TableWidget):
     setFont(tbl.horizontalHeader(), 12, QFont.Weight.DemiBold)
     tbl.verticalHeader().setDefaultSectionSize(30)
     tbl.setItemDelegate(FluentOnlyCheckDelegate(tbl))
+
+def append_capped_log(text_edit, text, max_lines=LOG_MAX_LINES):
+    if text_edit is None:
+        return
+
+    text_edit.append(text)
+    doc = text_edit.document()
+    overflow = doc.blockCount() - max_lines
+    if overflow <= 0:
+        return
+
+    cursor = QTextCursor(doc)
+    cursor.movePosition(QTextCursor.MoveOperation.Start)
+    for _ in range(overflow):
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        cursor.removeSelectedText()
+        cursor.deleteChar()
 
 def norm_path(text):
     if not text: return ""
@@ -2000,28 +2200,55 @@ class CleanPage(ScrollArea):
         
     def _est_w(self):
         t0 = time.time()
-        import fnmatch
         its=[(i,t) for i,t in enumerate(self.targets) if t[3]]
         if not its:
             self.sig.done.emit(f"估算失败：未勾选任何项目")
             return
+
+        job_queue = queue.Queue()
+        result_queue = queue.Queue()
+        worker_count = min(max(1, len(its)), 8)
+
+        for item in its:
+            job_queue.put(item)
+
+        # 估算主要是文件系统 IO，这里并行多个规则能明显缩短总耗时。
+        def _worker():
+            while not self.stop.is_set():
+                try:
+                    idx, entry = job_queue.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    size = estimate_rule_size(entry, stop_flag=self.stop)
+                    result_queue.put((idx, size))
+                finally:
+                    job_queue.task_done()
+
+        workers = []
+        for _ in range(worker_count):
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            workers.append(t)
+
         self.sig.prog.emit(0,len(its))
-        for n,(idx,t) in enumerate(its,1):
+        done_count = 0
+        while done_count < len(its):
             if self.stop.is_set():
+                for t in workers:
+                    t.join(timeout=0.1)
                 self.sig.done.emit(f"估算已取消，耗时 {time.time()-t0:.1f} 秒")
                 return
-            nm, pa, tp, _, nt, _, pattern = parse_rule_entry(t)
-            e=0
             try:
-                if tp=="dir": e=dir_size(expand_env(pa)) if os.path.isdir(expand_env(pa)) else 0
-                elif tp=="glob": 
-                    fo=expand_env(pa)
-                    if os.path.isdir(fo):
-                        rule_pattern = normalize_rule_pattern(tp, pattern, nt)
-                        e=sum(safe_getsize(os.path.join(fo,f)) for f in os.listdir(fo) if fnmatch.fnmatch(f.lower(), rule_pattern.lower()))
-                elif tp=="file": e=safe_getsize(expand_env(pa)) if os.path.isfile(expand_env(pa)) else 0
-            except: pass
-            self.sig.est.emit(idx,e); self.sig.prog.emit(n,len(its))
+                idx, size = result_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            done_count += 1
+            self.sig.est.emit(idx, size)
+            self.sig.prog.emit(done_count, len(its))
+
+        for t in workers:
+            t.join(timeout=0.1)
         self.sig.done.emit(f"估算完成，耗时 {time.time()-t0:.1f} 秒")
 
     def do_clean(self):
@@ -2521,6 +2748,8 @@ class BigFilePage(ScrollArea):
         pr=QHBoxLayout(); pr.setSpacing(10); pr.addWidget(CaptionLabel("最小文件MB:"))
         self.sp_mb=SpinBox(); self.sp_mb.setRange(50,10240); self.sp_mb.setValue(500); self.sp_mb.setFixedWidth(130); pr.addWidget(self.sp_mb)
         pr.addWidget(CaptionLabel("扫描上限:")); self.sp_mx=SpinBox(); self.sp_mx.setRange(50,2000); self.sp_mx.setValue(200); self.sp_mx.setFixedWidth(130); pr.addWidget(self.sp_mx)
+        self.chk_skip_special=CheckBox("跳过系统/虚拟机大文件"); self.chk_skip_special.setChecked(True); self.chk_skip_special.setToolTip("跳过分页/休眠/内存转储以及常见虚拟机磁盘镜像")
+        pr.addWidget(self.chk_skip_special)
         self.chk_perm=CheckBox("永久删除"); self.chk_perm.setChecked(True); pr.addWidget(self.chk_perm); pr.addStretch(); v.addLayout(pr)
 
         self.tbl=TableWidget(); self.tbl.setColumnCount(4); self.tbl.setHorizontalHeaderLabels([" ","文件名","大小","路径"])
@@ -2537,7 +2766,7 @@ class BigFilePage(ScrollArea):
         self.btn_sel_all.clicked.connect(self.toggle_sel_all); br.addWidget(self.btn_sel_all)
 
         b3=PushButton(FIF.DELETE,"删除已勾选"); b3.setFixedHeight(30); b3.clicked.connect(self.do_del); br.addWidget(b3)
-        b4=PushButton(FIF.CANCEL,"停止"); b4.setFixedHeight(30); b4.clicked.connect(lambda:self.stop.set()); br.addWidget(b4)
+        b4=PushButton(FIF.CANCEL,"停止"); b4.setFixedHeight(30); b4.clicked.connect(self._stop_current); br.addWidget(b4)
         br.addStretch(); v.addLayout(br)
 
         pg=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
@@ -2578,22 +2807,41 @@ class BigFilePage(ScrollArea):
 
     def _on_disk_ready(self, dtype, threads): self._disk_type = dtype; self._disk_threads = threads; self.lbl_disk.setText(f"类型：{dtype}  线程：{threads}")
 
+    def _stop_current(self):
+        self.stop.set()
+
     def do_scan(self):
         self.stop.clear(); self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
         threading.Thread(target=self._scan_w,daemon=True).start()
 
     def _scan_w(self):
         t0 = time.time()
-        mb=self.sp_mb.value(); mx=self.sp_mx.value(); w = self._disk_threads
+        mb=self.sp_mb.value(); mx=self.sp_mx.value()
         roots = [d for d, state in self.drive_states.items() if state]
-        if not roots: return
+        if not roots:
+            self.sig.big_done.emit("warning", "错误：未选择磁盘")
+            return
+        w, dtype = get_scan_threads_for_drives_cached(roots)
+        self.sig.disk_ready.emit(dtype, w)
         self.sig.log.emit(f"扫描 (≥{mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
-        res = scan_big_files(roots, mb*1024*1024, DEFAULT_EXCLUDES, self.stop, lambda n: self.sig.prog.emit(n % 100, 100), workers=w)
+        self.sig.big_prog.emit(0, 0)
+        self.sig.big_scan_count.emit(0)
+        skip_optional = self.chk_skip_special.isChecked()
+        res = scan_big_files(
+            roots,
+            mb*1024*1024,
+            DEFAULT_EXCLUDES,
+            self.stop,
+            workers=w,
+            result_limit=mx,
+            progress_cb=lambda scanned: self.sig.big_scan_count.emit(scanned),
+            skip_optional=skip_optional
+        )
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.big_done.emit("warning", f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
         for sz,pa in res[:mx]: self.sig.big_add.emit(str(sz), pa)
-        self.sig.done.emit(f"扫描完成，找到 {len(res[:mx])} 条，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.big_done.emit("success", f"扫描完成，找到 {len(res[:mx])} 条，耗时 {time.time()-t0:.1f} 秒")
 
     def do_del(self):
         paths=[self.tbl.item(r,3).text() for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r) and self.tbl.item(r,3)]
@@ -2607,12 +2855,12 @@ class BigFilePage(ScrollArea):
         ok=fl=0; tot=len(paths); lf=lambda s:self.sig.log.emit(s)
         for i,p in enumerate(paths,1):
             if self.stop.is_set():
-                self.sig.done.emit(f"删除已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.big_done.emit("warning", f"删除已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
                 return
             if delete_path(p,pm,lf): ok+=1
             else: fl+=1
-            self.sig.prog.emit(i,tot)
-        self.sig.done.emit(f"删除完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.big_prog.emit(i,tot)
+        self.sig.big_done.emit("success", f"删除完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
 class MoreCleanPage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
@@ -2768,17 +3016,107 @@ class MoreCleanPage(ScrollArea):
         dir_queue.put(_SENTINEL); [t.join(timeout=1) for t in threads]
         return res_files, res_dirs
 
+    def _walk_files_threaded(self, roots, excl, workers, file_cb=None, dir_cb=None, ext_filter=None):
+        dir_queue = queue.Queue()
+        for r in roots:
+            dir_queue.put(r)
+
+        def _worker():
+            while not self.stop.is_set():
+                try:
+                    d = dir_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if d is _SENTINEL:
+                    dir_queue.put(_SENTINEL)
+                    break
+                try:
+                    entries = os.scandir(d)
+                except:
+                    dir_queue.task_done()
+                    continue
+                try:
+                    for e in entries:
+                        if self.stop.is_set():
+                            break
+                        try:
+                            if e.is_symlink():
+                                continue
+                            if e.is_dir(follow_symlinks=False):
+                                if not should_exclude(e.path, excl):
+                                    dir_queue.put(e.path)
+                                    if dir_cb:
+                                        dir_cb(e.path)
+                            elif e.is_file(follow_symlinks=False):
+                                if ext_filter and not e.name.lower().endswith(ext_filter):
+                                    continue
+                                if file_cb:
+                                    file_cb(e.stat(follow_symlinks=False).st_size, e.path)
+                        except:
+                            pass
+                finally:
+                    try:
+                        entries.close()
+                    except:
+                        pass
+                dir_queue.task_done()
+
+        threads = []
+        for _ in range(workers):
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            threads.append(t)
+        while not self.stop.is_set():
+            try:
+                dir_queue.all_tasks_done.acquire()
+                if dir_queue.unfinished_tasks == 0:
+                    dir_queue.all_tasks_done.release()
+                    break
+                dir_queue.all_tasks_done.release()
+            except:
+                pass
+            time.sleep(0.1)
+        dir_queue.put(_SENTINEL)
+        [t.join(timeout=1) for t in threads]
+
     def _scan_duplicates(self, roots, workers):
         t0 = time.time()
-        files, _ = self._collect_files_threaded(roots, DEFAULT_EXCLUDES, workers)
+        size_counts = defaultdict(int)
+        size_lock = threading.Lock()
+
+        self.sig.log.emit("[重复文件] 第一阶段：统计文件大小...")
+
+        def _count_by_size(file_size, path):
+            if file_size <= 0:
+                return
+            with size_lock:
+                size_counts[file_size] += 1
+
+        self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_count_by_size)
         if self.stop.is_set():
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
 
+        suspect_sizes = {sz for sz, count in size_counts.items() if count > 1}
+        size_counts.clear()
+        if not suspect_sizes:
+            self.sig.done.emit(f"扫描完成，找到 0 个重复文件，耗时 {time.time()-t0:.1f} 秒")
+            return
+
+        self.sig.log.emit(f"[重复文件] 第二阶段：收集 {len(suspect_sizes)} 个可疑大小分组...")
         size_dict = defaultdict(list)
-        for sz, p in files:
-            if sz > 0:
-                size_dict[sz].append(p)
+        path_lock = threading.Lock()
+
+        def _collect_suspects(file_size, path):
+            if file_size not in suspect_sizes:
+                return
+            with path_lock:
+                size_dict[file_size].append(path)
+
+        self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_collect_suspects)
+        if self.stop.is_set():
+            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            return
 
         suspects = [(sz, paths) for sz, paths in size_dict.items() if len(paths) > 1]
 
@@ -2910,7 +3248,10 @@ class MoreCleanPage(ScrollArea):
                         try:
                             install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
                             if install_loc and not os.path.exists(install_loc):
-                                disp_name = winreg.QueryValueEx(sub_key, "DisplayName")[0] if "DisplayName" in [winreg.EnumValue(sub_key, j)[0] for j in range(winreg.QueryInfoKey(sub_key)[1])] else sub_name
+                                try:
+                                    disp_name = winreg.QueryValueEx(sub_key, "DisplayName")[0]
+                                except OSError:
+                                    disp_name = sub_name
                                 res.append(("无效卸载项", disp_name, "原目录已丢失", f"{'HKLM' if hkey==winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"))
                         except OSError: pass
                         winreg.CloseKey(sub_key)
@@ -3088,10 +3429,10 @@ class MainWindow(FluentWindow):
                         self.targets[i] = (nm, pa, tp, states[nm], nt, is_c, pattern)
             except: pass
                 
-        self.stop = threading.Event(); self.sig = Sig()
+        self.stop = threading.Event(); self.big_stop = threading.Event(); self.sig = Sig()
         self.pg_clean = CleanPage(self.sig, self.targets, self.stop, self)
         self.pg_rule_store = RuleStorePage(self, self)
-        self.pg_big = BigFilePage(self.sig, self.stop, self)
+        self.pg_big = BigFilePage(self.sig, self.big_stop, self)
         self.pg_uninstall = UninstallPage(self.sig, self.stop, self)
         self.pg_more = MoreCleanPage(self.sig, self.stop, self)
         self.pg_setting = SettingPage(self, self)
@@ -3332,6 +3673,7 @@ class MainWindow(FluentWindow):
     def _conn(self):
         self.sig.log.connect(self._log); self.sig.prog.connect(self._prog); self.sig.est.connect(self._est); self.sig.done.connect(self._done)
         self.sig.big_clr.connect(lambda: self.pg_big.tbl.setRowCount(0)); self.sig.big_add.connect(self._badd)
+        self.sig.big_prog.connect(self._big_prog); self.sig.big_done.connect(self._big_done); self.sig.big_scan_count.connect(self._big_scan_count)
         self.sig.more_clr.connect(lambda: self.pg_more.tbl.setRowCount(0)); self.sig.more_add.connect(self._madd)
         self.sig.uninst_clr.connect(lambda: self.pg_uninstall.tbl.setRowCount(0)); self.sig.uninst_add.connect(self._uadd)
         self.sig.update_found.connect(self._show_update_dialog)
@@ -3430,17 +3772,53 @@ class MainWindow(FluentWindow):
     def _log(self, t):
         line=f"[{self._ts()}] {t}"
         for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
-            p.log.append(line); p.sl.setText(t[:80])
+            append_capped_log(p.log, line)
+            p.sl.setText(t[:80])
 
     def _prog(self, v, m):
-        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more): p.pb.setRange(0,max(1,m)); p.pb.setValue(v)
+        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
+            if m <= 0:
+                p.pb.setRange(0, 0)
+            else:
+                p.pb.setRange(0, max(1, m))
+                p.pb.setValue(v)
 
     def _est(self, idx, val):
         if 0<=idx<self.pg_clean.tbl.rowCount():
-            it=self.pg_clean.tbl.item(idx,4); it.setText(human_size(val)) if it else None
+            try:
+                safe_val = max(0, int(val))
+            except Exception:
+                safe_val = 0
+            it=self.pg_clean.tbl.item(idx,4); it.setText(human_size(safe_val)) if it else None
+
+    def _big_prog(self, v, m):
+        if m <= 0:
+            self.pg_big.pb.setRange(0, 0)
+        else:
+            self.pg_big.pb.setRange(0, max(1, m))
+            self.pg_big.pb.setValue(v)
+
+    def _big_scan_count(self, scanned):
+        self.pg_big.sl.setText(f"已扫描 {max(0, int(scanned))} 个文件")
+
+    def _big_done(self, level, msg):
+        self.pg_big.pb.setRange(0, 100)
+        self.pg_big.pb.setValue(0)
+        self.pg_big.sl.setText("完成" if level == "success" else msg[:80])
+        line = f"[{self._ts()}] [完成] {msg}"
+        append_capped_log(self.pg_big.log, line)
+        bar_fn = {
+            "success": InfoBar.success,
+            "warning": InfoBar.warning,
+            "error": InfoBar.error
+        }.get(level, InfoBar.success)
+        bar_fn("完成" if level == "success" else "提示", msg, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=4000, parent=self)
 
     def _done(self, msg):
-        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more): p.pb.setValue(0); p.sl.setText("完成")
+        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
+            p.pb.setRange(0, 100)
+            p.pb.setValue(0)
+            p.sl.setText("完成")
         self.pg_clean.tbl.setDragEnabled(True) 
         self._log(f"[完成] {msg}"); InfoBar.success("完成",msg,orient=Qt.Orientation.Horizontal, isClosable=True,position=InfoBarPosition.TOP,duration=4000,parent=self)
 
