@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.0-alpha02
+C盘强力清理工具 v0.3.1
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.0-alpha02"
+CURRENT_VERSION = "0.3.1"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -2022,7 +2022,7 @@ class SettingPage(ScrollArea):
             self._make_setting_row(
                 FIF.INFO,
                 "检查更新",
-                "手动查询远程更新信息，并显示当前通道下的最新版本",
+                "",
                 btn_check_update,
                 self.lbl_latest_version
             )
@@ -2052,8 +2052,8 @@ class SettingPage(ScrollArea):
                     background: rgba(255, 255, 255, 0.04);
                 }
                 QWidget#settingIconTile {
-                    background: rgba(255, 255, 255, 0.06);
-                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    background: transparent;
+                    border: none;
                     border-radius: 12px;
                 }
                 QWidget#settingDivider {
@@ -2086,8 +2086,8 @@ class SettingPage(ScrollArea):
                     background: rgba(0, 120, 212, 0.045);
                 }
                 QWidget#settingIconTile {
-                    background: rgba(0, 120, 212, 0.09);
-                    border: 1px solid rgba(0, 120, 212, 0.10);
+                    background: transparent;
+                    border: none;
                     border-radius: 12px;
                 }
                 QWidget#settingDivider {
@@ -2214,13 +2214,14 @@ class SettingPage(ScrollArea):
         text_col.setSpacing(2)
         title_lbl = StrongBodyLabel(title)
         self._smooth_title_font(title_lbl)
-        desc_lbl = CaptionLabel(desc)
-        desc_lbl.setWordWrap(True)
-        desc_lbl.setTextColor(QColor(128, 128, 128))
         text_col.addWidget(title_lbl)
-        text_col.addWidget(desc_lbl)
+        if desc:
+            desc_lbl = CaptionLabel(str(desc))
+            desc_lbl.setWordWrap(True)
+            desc_lbl.setTextColor(QColor(128, 128, 128))
+            text_col.addWidget(desc_lbl)
         if detail_widget is not None:
-            text_col.addSpacing(4)
+            text_col.addSpacing(2)
             text_col.addWidget(detail_widget)
         layout.addLayout(text_col, 1)
         layout.addSpacing(10)
