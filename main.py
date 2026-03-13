@@ -1374,7 +1374,7 @@ def _normalize_rule_store_item(item):
         "filename": filename,
         "source": str(item.get("source", "")).strip() or "远程规则源",
         "summary": str(item.get("summary", "")).strip(),
-        "detail": str(item.get("detail", "")).strip() or "暂无详细介绍。"
+        "detail": str(item.get("detail", "")).strip() or "暂无详细介绍"
     }
 
 def load_rule_store_items():
@@ -1543,7 +1543,7 @@ class AddRuleDialog(MessageBoxBase):
     def _show_pattern_help(self):
         MessageBox(
             "匹配模式说明",
-            "匹配模式用于指定目录下哪些文件会被命中。\n\n"
+            "匹配模式用于指定目录下哪些文件会被命中\n\n"
             "常见写法：\n"
             "*.log  匹配所有 .log 文件\n"
             "*.tmp  匹配所有 .tmp 文件\n"
@@ -1879,7 +1879,7 @@ class RuleStorePage(ScrollArea):
             self.selected_item = None
             self.lbl_name.setText("未选择规则包")
             self.lbl_meta.setText("")
-            self.lbl_detail.setText("请先从左侧选择一个规则包。")
+            self.lbl_detail.setText("请先从左侧选择一个规则包")
             self.btn_import.setEnabled(False)
             return
         item = self.tbl.item(row, 0)
@@ -1971,19 +1971,19 @@ class SettingPage(ScrollArea):
             self._make_setting_row(
                 FIF.SAVE,
                 "退出时自动保存配置",
-                "自动保存常规清理中的勾选状态、自定义规则以及拖拽后的排序结果。",
+                "自动保存常规清理中的勾选状态、自定义规则以及拖拽后的排序结果",
                 self.switch_save
             ),
             self._make_setting_row(
                 FIF.SETTING,
                 "内置默认规则保护",
-                "开启后内置规则无法删除；关闭后可删除，且删除状态会保留到下次启动。",
+                "开启后内置规则无法删除；关闭后可删除，且删除状态会保留到下次启动",
                 self.switch_protect_builtin
             ),
             self._make_setting_row(
                 FIF.SYNC,
                 "刷新系统扫描缓存",
-                "清空硬盘类型检测缓存。更换或新增硬盘后，建议执行一次。",
+                "清空硬盘类型检测缓存更换或新增硬盘后，建议执行一次",
                 btn_cache
             )
         ]))
@@ -1993,19 +1993,19 @@ class SettingPage(ScrollArea):
             self._make_setting_row(
                 FIF.DOCUMENT,
                 "迁移旧版配置文件",
-                "检测 LOCALAPPDATA 中的旧版配置，并按你的选择迁移到当前配置目录。",
+                "检测 LOCALAPPDATA 中的旧版配置，并按你的选择迁移到当前配置目录",
                 btn_migrate
             ),
             self._make_setting_row(
                 FIF.DELETE,
                 "恢复默认配置",
-                "恢复常规清理的默认勾选与顺序，同时清除自定义规则。",
+                "恢复常规清理的默认勾选与顺序，同时清除自定义规则",
                 btn_reset
             ),
             self._make_setting_row(
                 FIF.FOLDER,
                 "配置保存目录",
-                "当前软件的规则、状态与全局设置都会保存在这里。",
+                "当前软件的规则、状态与全局设置都会保存在这里",
                 self._make_action_box(btn_cfg_browse, btn_cfg_reset),
                 self.lbl_config_dir
             )
@@ -2016,13 +2016,13 @@ class SettingPage(ScrollArea):
             self._make_setting_row(
                 FIF.UPDATE,
                 "更新通道",
-                "稳定版只接收正式版本；测试版会接收 alpha、beta、rc 等预发布版本。",
+                "稳定版只接收正式版本；测试版会接收 alpha、beta、rc 等预发布版本",
                 self.cb_update_channel
             ),
             self._make_setting_row(
                 FIF.INFO,
                 "检查更新",
-                "手动查询远程更新信息，并显示当前通道下的最新版本。",
+                "手动查询远程更新信息，并显示当前通道下的最新版本",
                 btn_check_update,
                 self.lbl_latest_version
             )
@@ -2699,7 +2699,7 @@ class CleanPage(ScrollArea):
         for item in its:
             job_queue.put(item)
 
-        # 估算主要是文件系统 IO，这里并行多个规则能明显缩短总耗时。
+        # 估算主要是文件系统 IO，这里并行多个规则能明显缩短总耗时
         def _worker():
             while not self.stop.is_set():
                 try:
@@ -2757,7 +2757,7 @@ class CleanPage(ScrollArea):
             content = (
                 "当前勾选项中检测到高风险清理规则：\n\n"
                 + "\n".join(f"- {line}" for line in preview)
-                + "\n\n这些规则可能影响系统、程序或用户目录。是否继续清理？"
+                + "\n\n这些规则可能影响系统、程序或用户目录是否继续清理？"
             )
             if not MessageBox("风险提示", content, self.window()).exec():
                 self.tbl.setDragEnabled(True)
@@ -3109,7 +3109,7 @@ class UninstallPage(ScrollArea):
 
         system_items = [item for item in risky_items if item.get("risk_kind") == "system"]
         impact_items = [item for item in risky_items if item.get("risk_kind") != "system"]
-        lines = ["本次勾选项目中包含高风险卸载项。"]
+        lines = ["本次勾选项目中包含高风险卸载项"]
 
         if system_items:
             lines.append("")
@@ -3126,7 +3126,7 @@ class UninstallPage(ScrollArea):
                 lines.append(f"- 另有 {len(impact_items) - 5} 项未展开")
 
         lines.append("")
-        lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常。是否继续？")
+        lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常是否继续？")
         return MessageBox("风险提示", "\n".join(lines), self.window()).exec()
 
     def do_std_uninstall(self):
@@ -3775,7 +3775,7 @@ class MoreCleanPage(ScrollArea):
                 ]
             )
 
-        # 先按文件大小筛，再用分层采样做快速分桶，最后只对疑似组做全量哈希。
+        # 先按文件大小筛，再用分层采样做快速分桶，最后只对疑似组做全量哈希
         results = []
         tot = len(suspects)
         for i, (file_size, paths) in enumerate(suspects, 1):
