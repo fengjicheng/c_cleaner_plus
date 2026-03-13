@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.0-alpha01
+C盘强力清理工具 v0.3.0-alpha02
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -479,6 +479,294 @@ def kill_app_processes(install_dir, log_fn):
     except Exception as e:
         log_fn(f"[内核猎杀] 异常: {e}")
 
+def _extract_command_executable(command_text):
+    text = str(command_text or "").strip()
+    if not text:
+        return ""
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end > 1:
+            return text[1:end]
+    m = re.match(r"([^\s]+)", text)
+    return m.group(1) if m else ""
+
+def _looks_like_install_root(path):
+    p = norm_path(path)
+    if not p:
+        return False
+    lower = p.lower()
+    blacklist = (
+        os.environ.get("SystemRoot", r"C:\Windows").lower(),
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "system32").lower(),
+        os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "installer").lower()
+    )
+    if lower in blacklist:
+        return False
+    base = os.path.basename(lower)
+    if base in {"uninstall.exe", "unins000.exe", "unins001.exe", "setup.exe", "update.exe"}:
+        return False
+    return True
+
+def infer_install_location(name="", publisher="", install_location="", uninstall_cmd="", display_icon=""):
+    direct = norm_path(install_location)
+    if direct and os.path.isdir(direct):
+        return direct
+
+    candidates = []
+    for raw in (display_icon, uninstall_cmd):
+        exe_path = norm_path(_extract_command_executable(raw))
+        if exe_path:
+            candidates.append(exe_path)
+
+    for candidate in candidates:
+        if os.path.isdir(candidate) and _looks_like_install_root(candidate):
+            return candidate
+        parent = os.path.dirname(candidate)
+        if parent and os.path.isdir(parent):
+            uninstall_markers = {"uninstall.exe", "unins000.exe", "unins001.exe", "setup.exe", "update.exe"}
+            if os.path.basename(candidate).lower() in uninstall_markers:
+                if _looks_like_install_root(parent):
+                    return parent
+            if _looks_like_install_root(parent):
+                return parent
+
+    keywords = [str(name or "").strip(), str(publisher or "").strip()]
+    keywords = [k for k in keywords if len(k) >= 3]
+    roots = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")
+    ]
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.scandir(root):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                lower_name = entry.name.lower()
+                if any(k.lower() in lower_name or lower_name in k.lower() for k in keywords):
+                    return entry.path
+        except Exception:
+            pass
+    return direct
+
+def build_uninstall_command(command_text, prefer_silent=False):
+    raw = str(command_text or "").strip()
+    if not raw:
+        return "", "无命令"
+    if not prefer_silent:
+        return raw, "标准"
+
+    lower = raw.lower()
+    exe_name = os.path.basename(_extract_command_executable(raw)).lower()
+
+    if "msiexec" in lower:
+        cmd = re.sub(r"(?i)\s/i(?=\s)", " /x", raw, count=1)
+        if not re.search(r"(?i)(/q[nrb]?|/quiet)", cmd):
+            cmd += " /qn /norestart"
+        return cmd, "静默(MSI)"
+
+    if exe_name.startswith("unins"):
+        cmd = raw
+        if "/verysilent" not in lower:
+            cmd += " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+        return cmd, "静默(Inno)"
+
+    if "nsis" in exe_name or "uninstall" in exe_name or "uninst" in exe_name:
+        if "/s" not in lower:
+            return raw + " /S", "静默(NSIS/通用)"
+        return raw, "静默(NSIS/通用)"
+
+    if "setup.exe" in exe_name or "installshield" in lower or "isscript" in lower:
+        if "/s" not in lower:
+            return raw + " /s", "静默(InstallShield)"
+        return raw, "静默(InstallShield)"
+
+    if "update.exe" in exe_name and "--uninstall" in lower:
+        cmd = raw
+        if "--silent" not in lower and "/silent" not in lower:
+            cmd += " --silent"
+        return cmd, "静默(Squirrel)"
+
+    if "bundle" in exe_name or "burn" in lower or "wix" in lower:
+        cmd = raw
+        if "/quiet" not in lower:
+            cmd += " /quiet /norestart"
+        return cmd, "静默(Burn/WiX)"
+
+    return raw, "标准"
+
+def terminate_process_tree(pid):
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except Exception:
+        pass
+
+def scan_leftover_services(keywords, install_dir=""):
+    results = []
+    seen = set()
+    install_dir_norm = norm_path(install_dir).lower()
+    service_root = r"SYSTEM\CurrentControlSet\Services"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, service_root)
+    except OSError:
+        return results
+
+    try:
+        count = winreg.QueryInfoKey(root)[0]
+        for i in range(count):
+            try:
+                service_name = winreg.EnumKey(root, i)
+                sub = winreg.OpenKey(root, service_name)
+            except OSError:
+                continue
+            try:
+                def _q(name):
+                    try:
+                        return str(winreg.QueryValueEx(sub, name)[0] or "")
+                    except OSError:
+                        return ""
+
+                display_name = _q("DisplayName")
+                image_path = norm_path(_q("ImagePath")).lower()
+                start_name = _q("Start")
+                type_raw = _q("Type")
+                text_blob = " ".join([service_name.lower(), display_name.lower(), image_path])
+                matched = bool(install_dir_norm and image_path and install_dir_norm in image_path)
+                if not matched:
+                    matched = any(kw in text_blob for kw in keywords if kw)
+                if matched:
+                    try:
+                        type_val = int(type_raw, 0) if type_raw else 0
+                    except Exception:
+                        type_val = 0
+                    service_kind = "驱动服务" if type_val & 0x1 or type_val & 0x2 else "Windows 服务"
+                    reg_path = f"HKLM\\{service_root}\\{service_name}"
+                    key = (service_name.lower(), reg_path.lower())
+                    if key not in seen:
+                        seen.add(key)
+                        results.append({
+                            "name": service_name,
+                            "display": display_name or service_name,
+                            "reg_path": reg_path,
+                            "kind": service_kind,
+                            "image_path": image_path,
+                            "start": start_name
+                        })
+            finally:
+                try:
+                    winreg.CloseKey(sub)
+                except OSError:
+                    pass
+    finally:
+        try:
+            winreg.CloseKey(root)
+        except OSError:
+            pass
+    return results
+
+def scan_leftover_tasks(keywords, install_dir=""):
+    install_dir_norm = norm_path(install_dir).lower()
+    results = []
+    seen = set()
+    ps_script = r"""
+$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+    [PSCustomObject]@{
+        TaskName = $_.TaskName
+        TaskPath = $_.TaskPath
+        Actions  = (($_.Actions | ForEach-Object { ($_.Execute + ' ' + $_.Arguments).Trim() }) -join '; ')
+    }
+}
+$tasks | ConvertTo-Json -Compress
+"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return results
+        payload = json.loads(r.stdout)
+        if isinstance(payload, dict):
+            payload = [payload]
+        for item in payload or []:
+            task_name = str(item.get("TaskName", "")).strip()
+            task_path = str(item.get("TaskPath", "\\")).strip() or "\\"
+            actions = str(item.get("Actions", "")).strip()
+            text_blob = " ".join([task_name.lower(), task_path.lower(), actions.lower()])
+            matched = bool(install_dir_norm and install_dir_norm in norm_path(actions).lower())
+            if not matched:
+                matched = any(kw in text_blob for kw in keywords if kw)
+            if matched and task_name:
+                full_name = f"{task_path}{task_name}" if task_path.endswith("\\") else f"{task_path}\\{task_name}"
+                key = full_name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    results.append({
+                        "name": task_name,
+                        "task_path": task_path,
+                        "full_name": full_name,
+                        "actions": actions
+                    })
+    except Exception:
+        return results
+    return results
+
+def delete_service_entry(service_name, reg_path, log_fn):
+    ok = True
+    try:
+        subprocess.run(
+            ["sc", "stop", service_name],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        r = subprocess.run(
+            ["sc", "delete", service_name],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        if r.returncode == 0:
+            log_fn(f"[删除服务] 成功: {service_name}")
+        else:
+            ok = False
+            err = (r.stderr or r.stdout or "").strip()
+            log_fn(f"[删除服务] 失败: {service_name} -> {err}")
+    except Exception as e:
+        ok = False
+        log_fn(f"[删除服务] 异常: {service_name} -> {e}")
+
+    reg_ok = force_delete_registry(reg_path, log_fn) if reg_path else True
+    return ok and reg_ok
+
+def delete_scheduled_task(full_name, log_fn):
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Delete", "/TN", full_name, "/F"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        if r.returncode == 0:
+            log_fn(f"[删除计划任务] 成功: {full_name}")
+            return True
+        err = (r.stderr or r.stdout or "").strip()
+        log_fn(f"[删除计划任务] 失败: {full_name} -> {err}")
+        return False
+    except Exception as e:
+        log_fn(f"[删除计划任务] 异常: {full_name} -> {e}")
+        return False
+
 # ══════════════════════════════════════════════════════════
 #  类型检测 + 缓存
 # ══════════════════════════════════════════════════════════
@@ -779,6 +1067,10 @@ def scan_big_files(roots, min_b, excl, stop, workers=4, result_limit=None, progr
 class Sig(QObject):
     log=Signal(str); prog=Signal(int,int); est=Signal(int, object)
     big_clr=Signal(); big_add=Signal(str,str); done=Signal(str)
+    clean_log=Signal(str); clean_prog=Signal(int,int); clean_done=Signal(str)
+    big_log=Signal(str)
+    uninst_log=Signal(str); uninst_prog=Signal(int,int); uninst_done=Signal(str)
+    more_log=Signal(str); more_prog=Signal(int,int); more_done=Signal(str)
     big_prog=Signal(int,int); big_done=Signal(str, str)
     big_scan_count=Signal(int)
     disk_ready=Signal(str,int); update_found=Signal(str, str, str)
@@ -1082,7 +1374,7 @@ def _normalize_rule_store_item(item):
         "filename": filename,
         "source": str(item.get("source", "")).strip() or "远程规则源",
         "summary": str(item.get("summary", "")).strip(),
-        "detail": str(item.get("detail", "")).strip() or "暂无详细介绍。"
+        "detail": str(item.get("detail", "")).strip() or "暂无详细介绍"
     }
 
 def load_rule_store_items():
@@ -1251,7 +1543,7 @@ class AddRuleDialog(MessageBoxBase):
     def _show_pattern_help(self):
         MessageBox(
             "匹配模式说明",
-            "匹配模式用于指定目录下哪些文件会被命中。\n\n"
+            "匹配模式用于指定目录下哪些文件会被命中\n\n"
             "常见写法：\n"
             "*.log  匹配所有 .log 文件\n"
             "*.tmp  匹配所有 .tmp 文件\n"
@@ -1587,7 +1879,7 @@ class RuleStorePage(ScrollArea):
             self.selected_item = None
             self.lbl_name.setText("未选择规则包")
             self.lbl_meta.setText("")
-            self.lbl_detail.setText("请先从左侧选择一个规则包。")
+            self.lbl_detail.setText("请先从左侧选择一个规则包")
             self.btn_import.setEnabled(False)
             return
         item = self.tbl.item(row, 0)
@@ -1621,182 +1913,319 @@ class SettingPage(ScrollArea):
         super().__init__(parent)
         self.main_win = main_win
         self.view = QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("settingPage"); self.enableTransparentBackground()
-        v = QVBoxLayout(self.view); v.setContentsMargins(28, 12, 28, 20); v.setSpacing(2)
-        v.addLayout(make_title_row(FIF.SETTING, "系统设置"))
+        self._apply_setting_style()
 
-        def _smooth_title_font(label):
-            # 仅处理设置页卡片标题，降低粗体带来的锯齿感
-            setFont(label, 13, QFont.Weight.Medium)
-            f = label.font()
-            f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-            label.setFont(f)
-
-        def _add_category_label(text):
-            lbl = CaptionLabel(text)
-            setFont(lbl, 12, QFont.Weight.Medium) #灰色小字体大小
-            lbl.setTextColor(QColor(128, 128, 128))
-            v.addSpacing(10) #灰色小字体上方留白
-            v.addWidget(lbl)
-
-        _add_category_label("基础设置")
-        # 1. 自动保存设置卡片
-        card_save = CardWidget(self.view)
-        cv_save = QVBoxLayout(card_save)
-        h_save = QHBoxLayout()
-        text_v_save = QVBoxLayout(); text_v_save.setSpacing(2)
-        lbl1 = StrongBodyLabel("退出时自动保存配置")
-        _smooth_title_font(lbl1)
-        lbl2 = CaptionLabel("开启后，将自动保存常规清理中的勾选状态、自定义规则以及你所拖动的排序结果")
-        lbl2.setTextColor(QColor(128, 128, 128))
-        text_v_save.addWidget(lbl1); text_v_save.addWidget(lbl2)
-        h_save.addLayout(text_v_save); h_save.addStretch()
+        v = QVBoxLayout(self.view); v.setContentsMargins(28, 12, 28, 24); v.setSpacing(12)
+        v.addWidget(self._make_header_box())
 
         self.switch_save = SwitchButton()
         self.switch_save.setOnText("开启"); self.switch_save.setOffText("关闭")
         self.switch_save.setChecked(self.main_win.global_settings.get("auto_save", True))
         self.switch_save.checkedChanged.connect(self._on_auto_save_changed)
-        h_save.addWidget(self.switch_save)
-        cv_save.addLayout(h_save)
-        v.addWidget(card_save)
-
-        # 2. 内置规则保护卡片
-        card_protect = CardWidget(self.view)
-        cv_protect = QVBoxLayout(card_protect)
-        h_protect = QHBoxLayout()
-        text_v_protect = QVBoxLayout(); text_v_protect.setSpacing(2)
-        lbl_protect1 = StrongBodyLabel("内置默认规则保护")
-        _smooth_title_font(lbl_protect1)
-        lbl_protect2 = CaptionLabel("开启后，常规清理中的内置默认规则无法删除；关闭后可删除，且删除结果会保留到下次启动")
-        lbl_protect2.setTextColor(QColor(128, 128, 128))
-        text_v_protect.addWidget(lbl_protect1); text_v_protect.addWidget(lbl_protect2)
-        h_protect.addLayout(text_v_protect); h_protect.addStretch()
 
         self.switch_protect_builtin = SwitchButton()
         self.switch_protect_builtin.setOnText("开启"); self.switch_protect_builtin.setOffText("关闭")
         self.switch_protect_builtin.setChecked(self.main_win.global_settings.get("protect_builtin_rules", True))
         self.switch_protect_builtin.checkedChanged.connect(self._on_protect_builtin_changed)
-        h_protect.addWidget(self.switch_protect_builtin)
-        cv_protect.addLayout(h_protect)
-        v.addWidget(card_protect)
 
-        # 3. 刷新缓存卡片
-        card_cache = CardWidget(self.view)
-        cv_cache = QVBoxLayout(card_cache)
-        h_cache = QHBoxLayout()
-        text_v_cache = QVBoxLayout(); text_v_cache.setSpacing(2)
-        lbl_cache1 = StrongBodyLabel("刷新系统扫描缓存")
-        _smooth_title_font(lbl_cache1)
-        lbl_cache2 = CaptionLabel("刷新自身软件对硬盘类型的检测缓存，当更换或添加硬盘后建议执行")
-        lbl_cache2.setTextColor(QColor(128, 128, 128))
-        text_v_cache.addWidget(lbl_cache1); text_v_cache.addWidget(lbl_cache2)
-        h_cache.addLayout(text_v_cache); h_cache.addStretch()
-        
         btn_cache = PushButton(FIF.SYNC, "刷新")
         btn_cache.clicked.connect(self._refresh_cache)
-        h_cache.addWidget(btn_cache)
-        cv_cache.addLayout(h_cache)
-        v.addWidget(card_cache)
-
-        _add_category_label("配置")
-        # 4. 迁移旧版配置卡片
-        card_migrate = CardWidget(self.view)
-        cv_migrate = QVBoxLayout(card_migrate)
-        h_migrate = QHBoxLayout()
-        text_v_migrate = QVBoxLayout(); text_v_migrate.setSpacing(2)
-        lbl_migrate1 = StrongBodyLabel("迁移旧版配置文件")
-        _smooth_title_font(lbl_migrate1)
-        lbl_migrate2 = CaptionLabel("检测 LOCALAPPDATA 中的旧版配置文件，并按你的选择迁移到当前配置目录")
-        lbl_migrate2.setTextColor(QColor(128, 128, 128))
-        text_v_migrate.addWidget(lbl_migrate1); text_v_migrate.addWidget(lbl_migrate2)
-        h_migrate.addLayout(text_v_migrate); h_migrate.addStretch()
+        self._style_action_control(btn_cache, 86)
 
         btn_migrate = PushButton(FIF.SYNC, "检测")
         btn_migrate.clicked.connect(self._detect_legacy_config)
-        h_migrate.addWidget(btn_migrate)
-        cv_migrate.addLayout(h_migrate)
-        v.addWidget(card_migrate)
+        self._style_action_control(btn_migrate, 86)
 
-        # 5. 恢复默认配置卡片
-        card_reset = CardWidget(self.view)
-        cv_reset = QVBoxLayout(card_reset)
-        h_reset = QHBoxLayout()
-        text_v_reset = QVBoxLayout(); text_v_reset.setSpacing(2)
-        lbl_reset1 = StrongBodyLabel("恢复默认配置")
-        _smooth_title_font(lbl_reset1)
-        lbl_reset2 = CaptionLabel("将常规清理的勾选项、拖拽排序恢复为初始状态，并清除所有自定义规则")
-        lbl_reset2.setTextColor(QColor(128, 128, 128))
-        text_v_reset.addWidget(lbl_reset1); text_v_reset.addWidget(lbl_reset2)
-        h_reset.addLayout(text_v_reset); h_reset.addStretch()
-        
         btn_reset = PushButton(FIF.UPDATE, "恢复")
         btn_reset.clicked.connect(self._reset_defaults)
-        h_reset.addWidget(btn_reset)
-        cv_reset.addLayout(h_reset)
-        v.addWidget(card_reset)
-
-        # 6. 配置目录卡片
-        card_cfg_dir = CardWidget(self.view)
-        cv_cfg_dir = QVBoxLayout(card_cfg_dir)
-        h_cfg_dir = QHBoxLayout()
-        text_v_cfg_dir = QVBoxLayout(); text_v_cfg_dir.setSpacing(2)
-        lbl_cfg1 = StrongBodyLabel("配置保存目录")
-        _smooth_title_font(lbl_cfg1)
-        self.lbl_config_dir = CaptionLabel("")
-        self.lbl_config_dir.setTextColor(QColor(128, 128, 128))
-        text_v_cfg_dir.addWidget(lbl_cfg1); text_v_cfg_dir.addWidget(self.lbl_config_dir)
-        h_cfg_dir.addLayout(text_v_cfg_dir); h_cfg_dir.addStretch()
+        self._style_action_control(btn_reset, 86)
 
         btn_cfg_browse = PushButton(FIF.FOLDER, "更改")
         btn_cfg_browse.clicked.connect(self._choose_config_dir)
-        h_cfg_dir.addWidget(btn_cfg_browse)
+        self._style_action_control(btn_cfg_browse, 82)
         btn_cfg_reset = PushButton(FIF.UPDATE, "默认")
         btn_cfg_reset.clicked.connect(self._reset_config_dir)
-        h_cfg_dir.addWidget(btn_cfg_reset)
-        cv_cfg_dir.addLayout(h_cfg_dir)
-        v.addWidget(card_cfg_dir)
-        self._refresh_config_dir_text()
-
-        _add_category_label("更新")
-        # 7. 更新通道卡片
-        card_update = CardWidget(self.view)
-        cv_update = QVBoxLayout(card_update)
-        h_update = QHBoxLayout()
-        text_v_update = QVBoxLayout(); text_v_update.setSpacing(2)
-        lbl_up1 = StrongBodyLabel("更新通道")
-        _smooth_title_font(lbl_up1)
-        lbl_up2 = CaptionLabel("选择稳定版仅接收正式版本推送；测试版会接收 alpha/beta/rc 等预发布版本")
-        lbl_up2.setTextColor(QColor(128, 128, 128))
-        text_v_update.addWidget(lbl_up1); text_v_update.addWidget(lbl_up2)
-        h_update.addLayout(text_v_update); h_update.addStretch()
+        self._style_action_control(btn_cfg_reset, 82)
 
         self.cb_update_channel = ComboBox()
         self.cb_update_channel.addItems(["稳定版", "测试版"])
         saved_channel = self.main_win.global_settings.get("update_channel", "stable")
         self.cb_update_channel.setCurrentIndex(1 if saved_channel == "beta" else 0)
         self.cb_update_channel.currentIndexChanged.connect(self._on_update_channel_changed)
-        h_update.addWidget(self.cb_update_channel)
-        cv_update.addLayout(h_update)
-        v.addWidget(card_update)
-
-        # 8. 手动检查更新卡片
-        card_check_update = CardWidget(self.view)
-        cv_check_update = QVBoxLayout(card_check_update)
-        h_check_update = QHBoxLayout()
-        text_v_check_update = QVBoxLayout(); text_v_check_update.setSpacing(2)
-        lbl_check1 = StrongBodyLabel("检查更新")
-        _smooth_title_font(lbl_check1)
-        self.lbl_latest_version = CaptionLabel("最新版本：获取中...")
-        self.lbl_latest_version.setTextColor(QColor(128, 128, 128))
-        text_v_check_update.addWidget(lbl_check1); text_v_check_update.addWidget(self.lbl_latest_version)
-        h_check_update.addLayout(text_v_check_update); h_check_update.addStretch()
+        self.cb_update_channel.setFixedWidth(116)
 
         btn_check_update = PushButton(FIF.SYNC, "检查")
         btn_check_update.clicked.connect(self._check_update_now)
-        h_check_update.addWidget(btn_check_update)
-        cv_check_update.addLayout(h_check_update)
-        v.addWidget(card_check_update)
+        self._style_action_control(btn_check_update, 86)
 
+        self.lbl_config_dir = CaptionLabel("")
+        self.lbl_config_dir.setTextColor(QColor(128, 128, 128))
+        self.lbl_config_dir.setWordWrap(True)
+
+        self.lbl_latest_version = CaptionLabel("最新版本：获取中...")
+        self.lbl_latest_version.setTextColor(QColor(128, 128, 128))
+        self.lbl_latest_version.setWordWrap(True)
+
+        v.addWidget(self._make_section_label("基础设置"))
+        v.addWidget(self._make_group_card([
+            self._make_setting_row(
+                FIF.SAVE,
+                "退出时自动保存配置",
+                "自动保存常规清理中的勾选状态、自定义规则以及拖拽后的排序结果",
+                self.switch_save
+            ),
+            self._make_setting_row(
+                FIF.SETTING,
+                "内置默认规则保护",
+                "开启后内置规则无法删除；关闭后可删除，且删除状态会保留到下次启动",
+                self.switch_protect_builtin
+            ),
+            self._make_setting_row(
+                FIF.SYNC,
+                "刷新系统扫描缓存",
+                "清空硬盘类型检测缓存更换或新增硬盘后，建议执行一次",
+                btn_cache
+            )
+        ]))
+
+        v.addWidget(self._make_section_label("配置"))
+        v.addWidget(self._make_group_card([
+            self._make_setting_row(
+                FIF.DOCUMENT,
+                "迁移旧版配置文件",
+                "检测 LOCALAPPDATA 中的旧版配置，并按你的选择迁移到当前配置目录",
+                btn_migrate
+            ),
+            self._make_setting_row(
+                FIF.DELETE,
+                "恢复默认配置",
+                "恢复常规清理的默认勾选与顺序，同时清除自定义规则",
+                btn_reset
+            ),
+            self._make_setting_row(
+                FIF.FOLDER,
+                "配置保存目录",
+                "当前软件的规则、状态与全局设置都会保存在这里",
+                self._make_action_box(btn_cfg_browse, btn_cfg_reset),
+                self.lbl_config_dir
+            )
+        ]))
+
+        v.addWidget(self._make_section_label("更新"))
+        v.addWidget(self._make_group_card([
+            self._make_setting_row(
+                FIF.UPDATE,
+                "更新通道",
+                "稳定版只接收正式版本；测试版会接收 alpha、beta、rc 等预发布版本",
+                self.cb_update_channel
+            ),
+            self._make_setting_row(
+                FIF.INFO,
+                "检查更新",
+                "手动查询远程更新信息，并显示当前通道下的最新版本",
+                btn_check_update,
+                self.lbl_latest_version
+            )
+        ]))
+
+        self._refresh_config_dir_text()
         v.addStretch()
+
+    def _apply_setting_style(self):
+        if isDarkTheme():
+            self.view.setStyleSheet("""
+                QWidget#settingHeader {
+                    background: rgba(32, 32, 32, 0.92);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 16px;
+                }
+                CardWidget#settingGroup {
+                    background: rgba(28, 28, 28, 0.96);
+                    border: 1px solid rgba(255, 255, 255, 0.07);
+                    border-radius: 18px;
+                }
+                QWidget#settingRow {
+                    background: transparent;
+                    border-radius: 12px;
+                }
+                QWidget#settingRow:hover {
+                    background: rgba(255, 255, 255, 0.04);
+                }
+                QWidget#settingIconTile {
+                    background: rgba(255, 255, 255, 0.06);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 12px;
+                }
+                QWidget#settingDivider {
+                    background: rgba(255, 255, 255, 0.08);
+                    min-height: 1px;
+                    max-height: 1px;
+                }
+                QWidget#settingChip {
+                    background: rgba(255, 255, 255, 0.06);
+                    border-radius: 10px;
+                }
+            """)
+        else:
+            self.view.setStyleSheet("""
+                QWidget#settingHeader {
+                    background: rgba(255, 255, 255, 0.78);
+                    border: 1px solid rgba(0, 0, 0, 0.07);
+                    border-radius: 16px;
+                }
+                CardWidget#settingGroup {
+                    background: rgba(255, 255, 255, 0.92);
+                    border: 1px solid rgba(0, 0, 0, 0.07);
+                    border-radius: 18px;
+                }
+                QWidget#settingRow {
+                    background: transparent;
+                    border-radius: 12px;
+                }
+                QWidget#settingRow:hover {
+                    background: rgba(0, 120, 212, 0.045);
+                }
+                QWidget#settingIconTile {
+                    background: rgba(0, 120, 212, 0.09);
+                    border: 1px solid rgba(0, 120, 212, 0.10);
+                    border-radius: 12px;
+                }
+                QWidget#settingDivider {
+                    background: rgba(0, 0, 0, 0.07);
+                    min-height: 1px;
+                    max-height: 1px;
+                }
+                QWidget#settingChip {
+                    background: rgba(0, 0, 0, 0.045);
+                    border-radius: 10px;
+                }
+            """)
+
+    def _style_action_control(self, widget, width=None):
+        widget.setFixedHeight(32)
+        if width is not None:
+            widget.setFixedWidth(width)
+
+    def _smooth_title_font(self, label):
+        setFont(label, 13, QFont.Weight.Medium)
+        font = label.font()
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        label.setFont(font)
+
+    def _make_header_chip(self, text):
+        chip = QWidget(self.view)
+        chip.setObjectName("settingChip")
+        layout = QHBoxLayout(chip)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(0)
+        lbl = CaptionLabel(text)
+        lbl.setTextColor(QColor(96, 96, 96))
+        layout.addWidget(lbl)
+        return chip
+
+    def _make_header_box(self):
+        box = QWidget(self.view)
+        box.setObjectName("settingHeader")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        title_row = make_title_row(FIF.SETTING, "系统设置")
+        layout.addLayout(title_row)
+
+        chip_row = QHBoxLayout()
+        chip_row.setSpacing(8)
+        chip_row.addWidget(self._make_header_chip(f"当前版本 v{CURRENT_VERSION}"))
+        channel_text = "测试版" if self.main_win.global_settings.get("update_channel", "stable") == "beta" else "稳定版"
+        self.lbl_channel_chip = CaptionLabel(f"更新通道 {channel_text}")
+        self.lbl_channel_chip.setTextColor(QColor(96, 96, 96))
+        chip = QWidget(self.view)
+        chip.setObjectName("settingChip")
+        chip_layout = QHBoxLayout(chip)
+        chip_layout.setContentsMargins(10, 5, 10, 5)
+        chip_layout.setSpacing(0)
+        chip_layout.addWidget(self.lbl_channel_chip)
+        chip_row.addWidget(chip)
+        self.lbl_latest_chip = CaptionLabel("最新版本 获取中...")
+        self.lbl_latest_chip.setTextColor(QColor(96, 96, 96))
+        latest_chip = QWidget(self.view)
+        latest_chip.setObjectName("settingChip")
+        latest_chip_layout = QHBoxLayout(latest_chip)
+        latest_chip_layout.setContentsMargins(10, 5, 10, 5)
+        latest_chip_layout.setSpacing(0)
+        latest_chip_layout.addWidget(self.lbl_latest_chip)
+        chip_row.addWidget(latest_chip)
+        chip_row.addStretch()
+        layout.addLayout(chip_row)
+        return box
+
+    def _make_section_label(self, text):
+        lbl = CaptionLabel(text)
+        setFont(lbl, 12, QFont.Weight.Medium)
+        lbl.setTextColor(QColor(128, 128, 128))
+        return lbl
+
+    def _make_group_card(self, rows):
+        card = CardWidget(self.view)
+        card.setObjectName("settingGroup")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(0)
+        for idx, row in enumerate(rows):
+            layout.addWidget(row)
+            if idx != len(rows) - 1:
+                layout.addWidget(self._make_divider())
+        return card
+
+    def _make_divider(self):
+        divider = QWidget(self.view)
+        divider.setObjectName("settingDivider")
+        divider.setFixedHeight(1)
+        return divider
+
+    def _make_action_box(self, *widgets):
+        box = QWidget(self.view)
+        layout = QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        for widget in widgets:
+            layout.addWidget(widget)
+        return box
+
+    def _make_setting_row(self, icon, title, desc, control_widget, detail_widget=None):
+        row = QWidget(self.view)
+        row.setObjectName("settingRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(10, 13, 10, 13)
+        layout.setSpacing(12)
+
+        tile = QWidget(row)
+        tile.setObjectName("settingIconTile")
+        tile.setFixedSize(40, 40)
+        tile_layout = QHBoxLayout(tile)
+        tile_layout.setContentsMargins(0, 0, 0, 0)
+        tile_layout.setSpacing(0)
+        icon_widget = IconWidget(icon)
+        icon_widget.setFixedSize(18, 18)
+        tile_layout.addWidget(icon_widget, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(tile, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        title_lbl = StrongBodyLabel(title)
+        self._smooth_title_font(title_lbl)
+        desc_lbl = CaptionLabel(desc)
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setTextColor(QColor(128, 128, 128))
+        text_col.addWidget(title_lbl)
+        text_col.addWidget(desc_lbl)
+        if detail_widget is not None:
+            text_col.addSpacing(4)
+            text_col.addWidget(detail_widget)
+        layout.addLayout(text_col, 1)
+        layout.addSpacing(10)
+        layout.addWidget(control_widget, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+        return row
 
     def _on_auto_save_changed(self, is_checked):
         self.main_win.global_settings["auto_save"] = is_checked
@@ -1839,6 +2268,8 @@ class SettingPage(ScrollArea):
 
     def _on_update_channel_changed(self, _):
         self.main_win.global_settings["update_channel"] = "beta" if self.cb_update_channel.currentIndex() == 1 else "stable"
+        if hasattr(self, "lbl_channel_chip"):
+            self.lbl_channel_chip.setText("更新通道 测试版" if self.main_win.global_settings["update_channel"] == "beta" else "更新通道 稳定版")
         self.main_win.save_global_settings()
         self.set_latest_version_text("最新版本：获取中...")
         self.main_win.check_updates(manual=False)
@@ -1848,6 +2279,8 @@ class SettingPage(ScrollArea):
 
     def set_latest_version_text(self, text):
         self.lbl_latest_version.setText(text)
+        if hasattr(self, "lbl_latest_chip"):
+            self.lbl_latest_chip.setText(text.replace("：", " ", 1))
 
     def _refresh_cache(self):
         try:
@@ -2048,18 +2481,18 @@ class CleanPage(ScrollArea):
     def _try_rst(self):
         if not getattr(self, 'chk_rst', None) or not self.chk_rst.isChecked(): return
         if not is_admin():
-            self.sig.log.emit("[还原点] 需管理员权限，跳过"); return
-        self.sig.log.emit("[还原点] 正在创建系统还原点，请稍候...")
+            self.sig.clean_log.emit("[还原点] 需管理员权限，跳过"); return
+        self.sig.clean_log.emit("[还原点] 正在创建系统还原点，请稍候...")
         try:
             r=subprocess.run(["powershell","-NoProfile","-ExecutionPolicy","Bypass",
                 "Checkpoint-Computer","-Description","'CleanTool_Backup'","-RestorePointType","MODIFY_SETTINGS"],
                 capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
             if r.returncode == 0:
-                self.sig.log.emit("[还原点] 创建成功！")
+                self.sig.clean_log.emit("[还原点] 创建成功！")
             else:
-                self.sig.log.emit(f"[还原点] 创建失败 (系统可能未开启保护或达到限制): {r.stderr.strip()[:100]}")
+                self.sig.clean_log.emit(f"[还原点] 创建失败 (系统可能未开启保护或达到限制): {r.stderr.strip()[:100]}")
         except Exception as e:
-            self.sig.log.emit(f"[还原点] 创建异常: {e}")
+            self.sig.clean_log.emit(f"[还原点] 创建异常: {e}")
 
     def save_custom_rules(self):
         self._sync() 
@@ -2256,7 +2689,7 @@ class CleanPage(ScrollArea):
         t0 = time.time()
         its=[(i,t) for i,t in enumerate(self.targets) if t[3]]
         if not its:
-            self.sig.done.emit(f"估算失败：未勾选任何项目")
+            self.sig.clean_done.emit(f"估算失败：未勾选任何项目")
             return
 
         job_queue = queue.Queue()
@@ -2266,7 +2699,7 @@ class CleanPage(ScrollArea):
         for item in its:
             job_queue.put(item)
 
-        # 估算主要是文件系统 IO，这里并行多个规则能明显缩短总耗时。
+        # 估算主要是文件系统 IO，这里并行多个规则能明显缩短总耗时
         def _worker():
             while not self.stop.is_set():
                 try:
@@ -2285,13 +2718,13 @@ class CleanPage(ScrollArea):
             t.start()
             workers.append(t)
 
-        self.sig.prog.emit(0,len(its))
+        self.sig.clean_prog.emit(0,len(its))
         done_count = 0
         while done_count < len(its):
             if self.stop.is_set():
                 for t in workers:
                     t.join(timeout=0.1)
-                self.sig.done.emit(f"估算已取消，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.clean_done.emit(f"估算已取消，耗时 {time.time()-t0:.1f} 秒")
                 return
             try:
                 idx, size = result_queue.get(timeout=0.1)
@@ -2299,11 +2732,11 @@ class CleanPage(ScrollArea):
                 continue
             done_count += 1
             self.sig.est.emit(idx, size)
-            self.sig.prog.emit(done_count, len(its))
+            self.sig.clean_prog.emit(done_count, len(its))
 
         for t in workers:
             t.join(timeout=0.1)
-        self.sig.done.emit(f"估算完成，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.clean_done.emit(f"估算完成，耗时 {time.time()-t0:.1f} 秒")
 
     def do_clean(self):
         self.tbl.setDragEnabled(False)
@@ -2324,7 +2757,7 @@ class CleanPage(ScrollArea):
             content = (
                 "当前勾选项中检测到高风险清理规则：\n\n"
                 + "\n".join(f"- {line}" for line in preview)
-                + "\n\n这些规则可能影响系统、程序或用户目录。是否继续清理？"
+                + "\n\n这些规则可能影响系统、程序或用户目录是否继续清理？"
             )
             if not MessageBox("风险提示", content, self.window()).exec():
                 self.tbl.setDragEnabled(True)
@@ -2344,10 +2777,10 @@ class CleanPage(ScrollArea):
         # 清理前创建还原点
         self._try_rst()
         
-        ok=fl=st=0; tot=len(sel); lf=lambda s:self.sig.log.emit(s)
+        ok=fl=st=0; tot=len(sel); lf=lambda s:self.sig.clean_log.emit(s)
         for nm, pa, tp, _, nt, _, pattern in sel:
             if self.stop.is_set():
-                self.sig.done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.clean_done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
                 return
             st+=1; p=expand_env(pa)
             try:
@@ -2367,8 +2800,8 @@ class CleanPage(ScrollArea):
                     if delete_path(p,pm,lf): ok+=1
                     else: fl+=1
             except: fl+=1
-            self.sig.prog.emit(st,tot)
-        self.sig.done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.clean_prog.emit(st,tot)
+        self.sig.clean_done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
 
 class LeftoversDialog(MessageBoxBase):
@@ -2378,7 +2811,7 @@ class LeftoversDialog(MessageBoxBase):
         self.publisher = publisher
         self.install_dir = install_dir
         self.uninst_reg = uninst_reg
-        self.leftovers = {"files": [], "regs": []}
+        self.leftovers = {"files": [], "regs": [], "services": [], "tasks": []}
         
         self.customTitle = TitleLabel(f"发现 '{app_name}' 的残留痕迹")
         setFont(self.customTitle, 16, QFont.Weight.Bold)
@@ -2413,6 +2846,23 @@ class LeftoversDialog(MessageBoxBase):
                 guess = os.path.join(base, kw)
                 if os.path.exists(guess) and guess not in paths_to_check:
                     paths_to_check.append(guess)
+
+        startup_dirs = [
+            os.path.join(app_data, r"Microsoft\Windows\Start Menu\Programs\Startup"),
+            os.path.join(prog_data, r"Microsoft\Windows\Start Menu\Programs\Startup")
+        ]
+        for startup_dir in startup_dirs:
+            if not startup_dir or not os.path.isdir(startup_dir):
+                continue
+            try:
+                for name in os.listdir(startup_dir):
+                    full_path = os.path.join(startup_dir, name)
+                    lower_name = name.lower()
+                    if any(kw in lower_name for kw in keywords):
+                        if full_path not in paths_to_check:
+                            paths_to_check.append(full_path)
+            except Exception:
+                pass
                     
         regs_to_check = []
         if self.uninst_reg: regs_to_check.append(self.uninst_reg)
@@ -2425,15 +2875,18 @@ class LeftoversDialog(MessageBoxBase):
                     regs_to_check.append(f"{base_key_str}\\{kw}")
                 except OSError: pass
 
-        self._populate_tree(paths_to_check, regs_to_check)
+        services = scan_leftover_services(keywords, self.install_dir)
+        tasks = scan_leftover_tasks(keywords, self.install_dir)
+        self._populate_tree(paths_to_check, regs_to_check, services, tasks)
 
-    def _populate_tree(self, files, regs):
+    def _populate_tree(self, files, regs, services, tasks):
         if files:
             f_root = QTreeWidgetItem(self.tree, ["文件与文件夹"])
             f_root.setFlags(f_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             f_root.setCheckState(0, Qt.CheckState.Checked)
             for f in files:
-                child = QTreeWidgetItem(f_root, ["文件夹", f])
+                item_type = "文件夹" if os.path.isdir(f) else "文件"
+                child = QTreeWidgetItem(f_root, [item_type, f])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Checked)
                 self.leftovers["files"].append((child, f))
@@ -2450,10 +2903,39 @@ class LeftoversDialog(MessageBoxBase):
                 self.leftovers["regs"].append((child, r))
             r_root.setExpanded(True)
 
+        if services:
+            s_root = QTreeWidgetItem(self.tree, ["服务与驱动"])
+            s_root.setFlags(s_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            s_root.setCheckState(0, Qt.CheckState.Checked)
+            for service in services:
+                detail = service["reg_path"]
+                if service.get("image_path"):
+                    detail = f'{service.get("kind", "服务")} | {service["image_path"]}'
+                child = QTreeWidgetItem(s_root, [f'{service.get("kind", "服务")}：{service["display"]}', detail])
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Checked)
+                self.leftovers["services"].append((child, service))
+            s_root.setExpanded(True)
+
+        if tasks:
+            t_root = QTreeWidgetItem(self.tree, ["计划任务"])
+            t_root.setFlags(t_root.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            t_root.setCheckState(0, Qt.CheckState.Checked)
+            for task in tasks:
+                detail = task.get("actions") or task["full_name"]
+                child = QTreeWidgetItem(t_root, [f'计划任务：{task["name"]}', detail])
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.CheckState.Checked)
+                self.leftovers["tasks"].append((child, task))
+            t_root.setExpanded(True)
+
     def get_selected_items(self):
-        del_files = [path for item, path in self.leftovers["files"] if item.checkState(0) == Qt.CheckState.Checked]
-        del_regs = [path for item, path in self.leftovers["regs"] if item.checkState(0) == Qt.CheckState.Checked]
-        return del_files, del_regs
+        return {
+            "files": [path for item, path in self.leftovers["files"] if item.checkState(0) == Qt.CheckState.Checked],
+            "regs": [path for item, path in self.leftovers["regs"] if item.checkState(0) == Qt.CheckState.Checked],
+            "services": [service for item, service in self.leftovers["services"] if item.checkState(0) == Qt.CheckState.Checked],
+            "tasks": [task for item, task in self.leftovers["tasks"] if item.checkState(0) == Qt.CheckState.Checked]
+        }
 
 class UninstallPage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
@@ -2469,6 +2951,17 @@ class UninstallPage(ScrollArea):
         self.search_input.setFixedWidth(300)
         self.search_input.textChanged.connect(self._filter_table)
         search_layout.addWidget(self.search_input)
+        search_layout.addSpacing(10)
+        self.chk_silent = CheckBox("优先静默卸载")
+        self.chk_silent.setToolTip("优先尝试 MSI、Inno、NSIS、InstallShield、Squirrel、Burn/WiX 等常见静默卸载参数")
+        search_layout.addWidget(self.chk_silent)
+        search_layout.addSpacing(10)
+        search_layout.addWidget(CaptionLabel("超时(分钟):"))
+        self.sp_timeout = SpinBox()
+        self.sp_timeout.setRange(1, 120)
+        self.sp_timeout.setValue(20)
+        self.sp_timeout.setFixedWidth(120)
+        search_layout.addWidget(self.sp_timeout)
         search_layout.addStretch()
         v.addLayout(search_layout)
 
@@ -2500,7 +2993,7 @@ class UninstallPage(ScrollArea):
             self.tbl.setRowHidden(r, not match)
 
     def do_scan(self):
-        self.stop.clear(); self.sig.uninst_clr.emit(); self.sig.log.emit("开始扫描系统软件列表...")
+        self.stop.clear(); self.sig.uninst_clr.emit(); self.sig.uninst_log.emit("开始扫描系统软件列表...")
         threading.Thread(target=self._scan_w, daemon=True).start()
 
     def _scan_w(self):
@@ -2512,7 +3005,7 @@ class UninstallPage(ScrollArea):
         
         for hkey, subkey_str in keys:
             if self.stop.is_set():
-                self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.uninst_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
                 return
             try:
                 key = winreg.OpenKey(hkey, subkey_str)
@@ -2536,15 +3029,16 @@ class UninstallPage(ScrollArea):
                                 icon_path = ""
                                 if d_icon:
                                     icon_path = d_icon.split(',')[0].strip(' "')
+                                inferred_loc = infer_install_location(disp, pub, loc, cmd, d_icon)
                                 
                                 reg = f"{'HKLM' if hkey==winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"
-                                meta = classify_uninstall_entry(disp, pub, loc, reg)
+                                meta = classify_uninstall_entry(disp, pub, inferred_loc or loc, reg)
                                 software.append({
                                     "name": disp,
                                     "version": ver,
                                     "publisher": pub,
                                     "cmd": cmd,
-                                    "location": loc,
+                                    "location": inferred_loc or loc,
                                     "reg": reg,
                                     "icon_path": icon_path,
                                     "category": meta["category"],
@@ -2581,7 +3075,7 @@ class UninstallPage(ScrollArea):
                 user_count += 1
             self.sig.uninst_add.emit(item)
 
-        self.sig.done.emit(f"成功扫描出 {len(unique)} 个软件（用户 {user_count}，系统 {system_count}），耗时 {time.time()-t0:.1f} 秒")
+        self.sig.uninst_done.emit(f"成功扫描出 {len(unique)} 个软件（用户 {user_count}，系统 {system_count}），耗时 {time.time()-t0:.1f} 秒")
 
     def _get_checked_rows_data(self):
         rows = []
@@ -2615,7 +3109,7 @@ class UninstallPage(ScrollArea):
 
         system_items = [item for item in risky_items if item.get("risk_kind") == "system"]
         impact_items = [item for item in risky_items if item.get("risk_kind") != "system"]
-        lines = ["本次勾选项目中包含高风险卸载项。"]
+        lines = ["本次勾选项目中包含高风险卸载项"]
 
         if system_items:
             lines.append("")
@@ -2632,40 +3126,62 @@ class UninstallPage(ScrollArea):
                 lines.append(f"- 另有 {len(impact_items) - 5} 项未展开")
 
         lines.append("")
-        lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常。是否继续？")
+        lines.append(f"继续{action_text}可能导致驱动、运行库、浏览器内核、安全防护或其他依赖组件异常是否继续？")
         return MessageBox("风险提示", "\n".join(lines), self.window()).exec()
 
     def do_std_uninstall(self):
         data = self._get_checked_rows_data()
         if not data:
-            self.sig.log.emit("请先勾选至少一个要卸载的软件！"); return
+            self.sig.uninst_log.emit("请先勾选至少一个要卸载的软件！"); return
         if not self._confirm_risky_selection(data, "标准卸载"):
-            self.sig.log.emit("已取消高风险标准卸载操作")
+            self.sig.uninst_log.emit("已取消高风险标准卸载操作")
             return
         self.stop.clear()
-        threading.Thread(target=self._std_uninstall_w, args=(data,), daemon=True).start()
+        threading.Thread(
+            target=self._std_uninstall_w,
+            args=(data, self.chk_silent.isChecked(), self.sp_timeout.value() * 60),
+            daemon=True
+        ).start()
 
-    def _std_uninstall_w(self, data):
+    def _std_uninstall_w(self, data, prefer_silent=False, timeout_sec=1200):
         t0 = time.time()
         ok = fl = sk = 0
         tot = len(data)
         for i, item in enumerate(data, 1):
             r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; cmd = item["cmd"]; reg = item["reg"]
             if self.stop.is_set():
-                self.sig.done.emit(f"标准卸载已取消：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.uninst_done.emit(f"标准卸载已取消：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
                 return
 
             if not cmd:
-                self.sig.log.emit(f"[标准卸载] 跳过 {nm}：未提供卸载命令，请改用强力卸载")
+                self.sig.uninst_log.emit(f"[标准卸载] 跳过 {nm}：未提供卸载命令，请改用强力卸载")
                 sk += 1
-                self.sig.prog.emit(i, tot)
+                self.sig.uninst_prog.emit(i, tot)
                 continue
 
-            self.sig.log.emit(f"[标准卸载] 正在调用官方卸载程序: {nm}")
+            run_cmd, mode_text = build_uninstall_command(cmd, prefer_silent=prefer_silent)
+            self.sig.uninst_log.emit(f"[标准卸载] 正在调用{mode_text}卸载: {nm}")
             try:
-                proc = subprocess.Popen(cmd, shell=True)
-                proc.wait()
+                proc = subprocess.Popen(run_cmd, shell=True)
+                try:
+                    proc.wait(timeout=max(30, int(timeout_sec)))
+                except subprocess.TimeoutExpired:
+                    terminate_process_tree(proc.pid)
+                    fl += 1
+                    self.sig.uninst_log.emit(f"[标准卸载] 超时已终止: {nm}（超过 {max(30, int(timeout_sec)) // 60} 分钟）")
+                    self.sig.uninst_prog.emit(i, tot)
+                    continue
+
+                if proc.returncode not in (0, None):
+                    fl += 1
+                    self.sig.uninst_log.emit(f"[标准卸载] 返回码异常: {nm} -> {proc.returncode}")
+                    self.sig.uninst_prog.emit(i, tot)
+                    continue
+
                 ok += 1
+                verify_msgs = self._verify_uninstall_result(nm, loc, reg)
+                for msg in verify_msgs:
+                    self.sig.uninst_log.emit(msg)
 
                 # 串行等待用户处理“是否扫描残留”的弹窗，避免多选时上下文错位
                 self._current_uninstalling = (r, nm, pub, loc, reg)
@@ -2675,11 +3191,35 @@ class UninstallPage(ScrollArea):
                 self._leftover_prompt_done.wait()
             except Exception as e:
                 fl += 1
-                self.sig.log.emit(f"[标准卸载] 启动失败: {nm} -> {e}")
+                self.sig.uninst_log.emit(f"[标准卸载] 启动失败: {nm} -> {e}")
 
-            self.sig.prog.emit(i, tot)
+            self.sig.uninst_prog.emit(i, tot)
 
-        self.sig.done.emit(f"标准卸载流程结束：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.uninst_done.emit(f"标准卸载流程结束：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
+
+    def _verify_uninstall_result(self, app_name, install_dir, reg_path):
+        messages = []
+        path_text = norm_path(install_dir)
+        if path_text and os.path.exists(path_text):
+            messages.append(f"[卸载校验] {app_name} 安装目录仍存在: {path_text}")
+        if reg_path:
+            hive_name, _, subkey = reg_path.partition("\\")
+            hive_map = {
+                "HKLM": winreg.HKEY_LOCAL_MACHINE,
+                "HKCU": winreg.HKEY_CURRENT_USER,
+                "HKCR": winreg.HKEY_CLASSES_ROOT
+            }
+            hkey = hive_map.get(hive_name)
+            if hkey and subkey:
+                try:
+                    k = winreg.OpenKey(hkey, subkey)
+                    winreg.CloseKey(k)
+                    messages.append(f"[卸载校验] {app_name} 卸载注册表项仍存在")
+                except OSError:
+                    pass
+        if not messages:
+            messages.append(f"[卸载校验] {app_name} 主要卸载痕迹已移除")
+        return messages
 
     @Slot()
     def prompt_leftover_scan(self):
@@ -2697,41 +3237,49 @@ class UninstallPage(ScrollArea):
     def do_force_uninstall(self):
         data = self._get_checked_rows_data()
         if not data:
-            self.sig.log.emit("请先勾选目标软件！"); return
+            self.sig.uninst_log.emit("请先勾选目标软件！"); return
         if not self._confirm_risky_selection(data, "强力卸载"):
-            self.sig.log.emit("已取消高风险强力卸载操作")
+            self.sig.uninst_log.emit("已取消高风险强力卸载操作")
             return
 
         all_files, all_regs = [], []
+        all_services, all_tasks = [], []
         chosen_apps = 0
         for item in data:
             r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; reg = item["reg"]
             picked = self._pick_leftovers(nm, pub, loc, reg)
             if picked is None:
                 continue
-            del_files, del_regs = picked
-            if not del_files and not del_regs:
+            del_files = picked["files"]; del_regs = picked["regs"]
+            del_services = picked["services"]; del_tasks = picked["tasks"]
+            if not del_files and not del_regs and not del_services and not del_tasks:
                 continue
             chosen_apps += 1
             all_files.extend(del_files)
             all_regs.extend(del_regs)
+            all_services.extend(del_services)
+            all_tasks.extend(del_tasks)
 
         if chosen_apps == 0:
-            self.sig.log.emit("未选择任何残留项，操作已取消")
+            self.sig.uninst_log.emit("未选择任何残留项，操作已取消")
             return
 
         # 去重并保持顺序，避免重复删除同一路径/注册表键
         all_files = list(dict.fromkeys(all_files))
         all_regs = list(dict.fromkeys(all_regs))
-        self.sig.log.emit(f"[强力清除] 批量任务已确认：软件 {chosen_apps} 个，文件/目录 {len(all_files)} 项，注册表 {len(all_regs)} 项")
+        all_services = list({service["name"].lower(): service for service in all_services}.values())
+        all_tasks = list({task["full_name"].lower(): task for task in all_tasks}.values())
+        self.sig.uninst_log.emit(
+            f"[强力清除] 批量任务已确认：软件 {chosen_apps} 个，文件/目录 {len(all_files)} 项，注册表 {len(all_regs)} 项，服务 {len(all_services)} 项，计划任务 {len(all_tasks)} 项"
+        )
         self.stop.clear()
-        threading.Thread(target=self._force_uninst_w, args=(all_files, all_regs), daemon=True).start()
+        threading.Thread(target=self._force_uninst_w, args=(all_files, all_regs, all_services, all_tasks), daemon=True).start()
 
     def _pick_leftovers(self, nm, pub, loc, reg):
         dialog = LeftoversDialog(self.window(), nm, pub, loc, reg)
         if dialog.tree.topLevelItemCount() == 0:
             InfoBar.success("扫描完毕", f"未发现 '{nm}' 的明显残留", parent=self.window())
-            return [], []
+            return {"files": [], "regs": [], "services": [], "tasks": []}
         if not dialog.exec():
             return None
         return dialog.get_selected_items()
@@ -2740,16 +3288,19 @@ class UninstallPage(ScrollArea):
         picked = self._pick_leftovers(nm, pub, loc, reg)
         if picked is None:
             return
-        del_files, del_regs = picked
-        if not del_files and not del_regs:
+        del_files = picked["files"]; del_regs = picked["regs"]
+        del_services = picked["services"]; del_tasks = picked["tasks"]
+        if not del_files and not del_regs and not del_services and not del_tasks:
             return
-        self.sig.log.emit(f"[强力清除] 开始清理 {nm} 的残留...")
+        self.sig.uninst_log.emit(f"[强力清除] 开始清理 {nm} 的残留...")
         self.stop.clear()
-        threading.Thread(target=self._force_uninst_w, args=(del_files, del_regs), daemon=True).start()
+        threading.Thread(target=self._force_uninst_w, args=(del_files, del_regs, del_services, del_tasks), daemon=True).start()
 
-    def _force_uninst_w(self, files, regs):
+    def _force_uninst_w(self, files, regs, services=None, tasks=None):
         t0 = time.time()
-        lf = lambda s: self.sig.log.emit(s)
+        lf = lambda s: self.sig.uninst_log.emit(s)
+        services = services or []
+        tasks = tasks or []
         
         # 1. 第一步：猎杀后台进程，解除文件死锁
         for f in files:
@@ -2758,19 +3309,25 @@ class UninstallPage(ScrollArea):
                 kill_app_processes(f, lf)
                 time.sleep(0.5) # 给系统一点时间释放文件句柄
 
-        # 2. 第二步：强力粉碎注册表 (调用原生 reg delete)
+        # 2. 第二步：删除服务与计划任务
+        for service in services:
+            delete_service_entry(service.get("name", ""), service.get("reg_path", ""), lf)
+        for task in tasks:
+            delete_scheduled_task(task.get("full_name", ""), lf)
+
+        # 3. 第三步：强力粉碎注册表 (调用原生 reg delete)
         for r in regs:
             # 这里的 r 格式是 "HKLM\Software\xxx"
             force_delete_registry(r, lf)
             
-        # 3. 第三步：强制摧毁残留文件与目录
+        # 4. 第四步：强制摧毁残留文件与目录
         for f in files:
             if delete_path(f, True, lf): 
-                self.sig.log.emit(f"[强删文件] 成功移除: {f}")
+                self.sig.uninst_log.emit(f"[强删文件] 成功移除: {f}")
             else:
-                self.sig.log.emit(f"[强删文件] 失败(可能仍有驱动级锁定): {f}")
+                self.sig.uninst_log.emit(f"[强删文件] 失败(可能仍有驱动级锁定): {f}")
             
-        self.sig.done.emit(f"强力清理完成，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.uninst_done.emit(f"强力清理完成，耗时 {time.time()-t0:.1f} 秒")
 
 class BigFilePage(ScrollArea):
     def __init__(self, sig, stop, parent=None):
@@ -2891,7 +3448,7 @@ class BigFilePage(ScrollArea):
             return
         w, dtype = get_scan_threads_for_drives_cached(roots)
         self.sig.disk_ready.emit(dtype, w)
-        self.sig.log.emit(f"扫描 (≥{mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
+        self.sig.big_log.emit(f"扫描 (≥{mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
         self.sig.big_prog.emit(0, 0)
         self.sig.big_scan_count.emit(0)
         skip_optional = self.chk_skip_special.isChecked()
@@ -2920,7 +3477,7 @@ class BigFilePage(ScrollArea):
 
     def _del_w(self, paths, pm):
         t0 = time.time()
-        ok=fl=0; tot=len(paths); lf=lambda s:self.sig.log.emit(s)
+        ok=fl=0; tot=len(paths); lf=lambda s:self.sig.big_log.emit(s)
         for i,p in enumerate(paths,1):
             if self.stop.is_set():
                 self.sig.big_done.emit("warning", f"删除已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
@@ -3032,8 +3589,8 @@ class MoreCleanPage(ScrollArea):
 
     def do_scan(self):
         idx = self.cb_mode.currentIndex(); roots = [d for d, state in self.drive_states.items() if state]
-        if idx not in (3, 4) and not roots: self.sig.done.emit("错误：未选择磁盘"); return
-        self.stop.clear(); self.sig.more_clr.emit(); self.sig.log.emit(f"开始 {self.cb_mode.currentText()}...")
+        if idx not in (3, 4) and not roots: self.sig.more_done.emit("错误：未选择磁盘"); return
+        self.stop.clear(); self.sig.more_clr.emit(); self.sig.more_log.emit(f"开始 {self.cb_mode.currentText()}...")
         
         self.btn_sel_all.setText("全选")
         self.btn_sel_all.setIcon(FIF.ACCEPT)
@@ -3132,7 +3689,7 @@ class MoreCleanPage(ScrollArea):
         size_groups = defaultdict(list)
         size_lock = threading.Lock()
 
-        self.sig.log.emit("[重复文件] 第一阶段：识别可疑大小分组...")
+        self.sig.more_log.emit("[重复文件] 第一阶段：识别可疑大小分组...")
 
         def _collect_candidates(file_size, path):
             if file_size <= 0:
@@ -3153,16 +3710,16 @@ class MoreCleanPage(ScrollArea):
 
         self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_collect_candidates)
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
 
         first_path_by_size.clear()
         if not size_groups:
-            self.sig.done.emit(f"扫描完成，找到 0 个重复文件，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描完成，找到 0 个重复文件，耗时 {time.time()-t0:.1f} 秒")
             return
 
         suspects = [(sz, paths) for sz, paths in size_groups.items() if len(paths) > 1]
-        self.sig.log.emit(f"[重复文件] 第二阶段：校验 {len(suspects)} 个可疑大小分组...")
+        self.sig.more_log.emit(f"[重复文件] 第二阶段：校验 {len(suspects)} 个可疑大小分组...")
 
         def _get_hash(path, head_bytes=None, tail_bytes=0, sample_offsets=None):
             m = hashlib.md5()
@@ -3218,12 +3775,12 @@ class MoreCleanPage(ScrollArea):
                 ]
             )
 
-        # 先按文件大小筛，再用分层采样做快速分桶，最后只对疑似组做全量哈希。
+        # 先按文件大小筛，再用分层采样做快速分桶，最后只对疑似组做全量哈希
         results = []
         tot = len(suspects)
         for i, (file_size, paths) in enumerate(suspects, 1):
             if self.stop.is_set(): break
-            self.sig.prog.emit(i, tot)
+            self.sig.more_prog.emit(i, tot)
 
             quick_dict = defaultdict(list)
             for p in paths:
@@ -3244,7 +3801,7 @@ class MoreCleanPage(ScrollArea):
                         results.append((file_size, duplicates))
 
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
 
         normalized_results = []
@@ -3265,21 +3822,21 @@ class MoreCleanPage(ScrollArea):
                 hidden_cnt += hidden
                 self.sig.more_add.emit(False, "重复文件", f"组 {grp_id}", f"{human_size(file_size)} | 另有 {hidden} 个未展开", "")
         if hidden_cnt > 0:
-            self.sig.log.emit(f"[重复文件] 已折叠 {hidden_cnt} 个超大重复组结果，仅展示每组前 {DUPLICATE_GROUP_DISPLAY_LIMIT} 项")
-            self.sig.done.emit(f"扫描完成，展示 {cnt} 个重复文件，另有 {hidden_cnt} 个未展开，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_log.emit(f"[重复文件] 已折叠 {hidden_cnt} 个超大重复组结果，仅展示每组前 {DUPLICATE_GROUP_DISPLAY_LIMIT} 项")
+            self.sig.more_done.emit(f"扫描完成，展示 {cnt} 个重复文件，另有 {hidden_cnt} 个未展开，耗时 {time.time()-t0:.1f} 秒")
             return
-        self.sig.done.emit(f"扫描完成，找到 {cnt} 个重复文件，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(f"扫描完成，找到 {cnt} 个重复文件，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_empty_dirs(self, roots, workers):
         t0 = time.time()
         _, dirs = self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, collect_dirs=True)
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
         dirs.sort(key=len, reverse=True); empty_set = set(); tot = len(dirs)
         for i, d in enumerate(dirs):
             if self.stop.is_set(): break
-            if i % 500 == 0: self.sig.prog.emit(i, tot)
+            if i % 500 == 0: self.sig.more_prog.emit(i, tot)
             try:
                 is_empty = True
                 for item in os.scandir(d):
@@ -3288,15 +3845,15 @@ class MoreCleanPage(ScrollArea):
                 if is_empty: empty_set.add(d); self.sig.more_add.emit(False, "空文件夹", os.path.basename(d), "无内容", d)
             except: pass
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
-        self.sig.done.emit(f"扫描完成，找到 {len(empty_set)} 个空文件夹，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(f"扫描完成，找到 {len(empty_set)} 个空文件夹，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_shortcuts(self, roots, workers):
         t0 = time.time()
         files, _ = self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, ext_filter=".lnk", collect_files=True)
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
         def resolve_lnk_target(path):
             try:
@@ -3313,14 +3870,14 @@ class MoreCleanPage(ScrollArea):
         tot = len(files); invalid_cnt = 0
         for i, (_, p) in enumerate(files):
             if self.stop.is_set(): break
-            if i % 100 == 0: self.sig.prog.emit(i, tot)
+            if i % 100 == 0: self.sig.more_prog.emit(i, tot)
             target = resolve_lnk_target(p)
             if target and not os.path.exists(target):
                 self.sig.more_add.emit(False, "无效快捷方式", os.path.basename(p), "指向缺失的文件", p); invalid_cnt += 1
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
-        self.sig.done.emit(f"扫描完成，找到 {invalid_cnt} 个无效快捷方式，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(f"扫描完成，找到 {invalid_cnt} 个无效快捷方式，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_registry(self):
         t0 = time.time()
@@ -3349,10 +3906,10 @@ class MoreCleanPage(ScrollArea):
                 winreg.CloseKey(key)
             except OSError: pass
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
         for tp, nm, det, path in res: self.sig.more_add.emit(False, tp, nm, det, path)
-        self.sig.done.emit(f"扫描完成，找到 {len(res)} 个无效注册表卸载项，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(f"扫描完成，找到 {len(res)} 个无效注册表卸载项，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_context_menu(self):
         t0 = time.time()
@@ -3369,10 +3926,10 @@ class MoreCleanPage(ScrollArea):
                 winreg.CloseKey(key)
             except: pass
         if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
         for tp, nm, det, path in res: self.sig.more_add.emit(False, tp, nm, det, path)
-        self.sig.done.emit(f"扫描完成，列出 {len(res)} 个右键菜单扩展，耗时 {time.time()-t0:.1f} 秒")
+        self.sig.more_done.emit(f"扫描完成，列出 {len(res)} 个右键菜单扩展，耗时 {time.time()-t0:.1f} 秒")
 
     def do_del(self):
         paths=[self.tbl.item(r,4).text() for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r)]
@@ -3392,7 +3949,7 @@ class MoreCleanPage(ScrollArea):
                     allowed.append(p)
 
             if blocked:
-                self.sig.log.emit(f"[保护] 已阻止清理 {len(blocked)} 个位于 C 盘的重复文件")
+                self.sig.more_log.emit(f"[保护] 已阻止清理 {len(blocked)} 个位于 C 盘的重复文件")
                 InfoBar.warning(
                     "已阻止",
                     f"重复文件模式禁止清理 C 盘文件，已跳过 {len(blocked)} 项",
@@ -3414,32 +3971,32 @@ class MoreCleanPage(ScrollArea):
 
     def _del_files_w(self, paths, pm):
         t0 = time.time()
-        ok=fl=0; tot=len(paths); lf=lambda s:self.sig.log.emit(s)
+        ok=fl=0; tot=len(paths); lf=lambda s:self.sig.more_log.emit(s)
         for i,p in enumerate(paths,1):
             if self.stop.is_set():
-                self.sig.done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.more_done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
                 return
             if delete_path(p,pm,lf): ok+=1
             else: fl+=1
-            self.sig.prog.emit(i,tot)
-        self.sig.done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_prog.emit(i,tot)
+        self.sig.more_done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
     def _del_reg_w(self, paths):
         t0 = time.time()
         ok=fl=0; tot=len(paths)
         for i, p in enumerate(paths, 1):
             if self.stop.is_set():
-                self.sig.done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+                self.sig.more_done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
                 return
             
             # 使用新的强制删除函数
-            if force_delete_registry(p, self.sig.log.emit):
+            if force_delete_registry(p, self.sig.more_log.emit):
                 ok += 1
             else:
                 fl += 1
                 
-            self.sig.prog.emit(i, tot)
-        self.sig.done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
+            self.sig.more_prog.emit(i, tot)
+        self.sig.more_done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
 
 # ══════════════════════════════════════════════════════════
@@ -3519,11 +4076,11 @@ class MainWindow(FluentWindow):
                         self.targets[i] = (nm, pa, tp, states[nm], nt, is_c, pattern)
             except: pass
                 
-        self.stop = threading.Event(); self.big_stop = threading.Event(); self.more_stop = threading.Event(); self.sig = Sig()
-        self.pg_clean = CleanPage(self.sig, self.targets, self.stop, self)
+        self.clean_stop = threading.Event(); self.uninstall_stop = threading.Event(); self.big_stop = threading.Event(); self.more_stop = threading.Event(); self.sig = Sig()
+        self.pg_clean = CleanPage(self.sig, self.targets, self.clean_stop, self)
         self.pg_rule_store = RuleStorePage(self, self)
         self.pg_big = BigFilePage(self.sig, self.big_stop, self)
-        self.pg_uninstall = UninstallPage(self.sig, self.stop, self)
+        self.pg_uninstall = UninstallPage(self.sig, self.uninstall_stop, self)
         self.pg_more = MoreCleanPage(self.sig, self.more_stop, self)
         self.pg_setting = SettingPage(self, self)
         self._update_checking = False
@@ -3761,11 +4318,25 @@ class MainWindow(FluentWindow):
         if scr: g=scr.availableGeometry(); self.move((g.width()-self.width())//2,(g.height()-self.height())//2)
 
     def _conn(self):
-        self.sig.log.connect(self._log); self.sig.prog.connect(self._prog); self.sig.est.connect(self._est); self.sig.done.connect(self._done)
+        self.sig.clean_log.connect(lambda t: self._page_log(self.pg_clean, t))
+        self.sig.clean_prog.connect(lambda v, m: self._page_prog(self.pg_clean, v, m))
+        self.sig.clean_done.connect(self._clean_done)
+        self.sig.est.connect(self._est)
+
+        self.sig.big_log.connect(lambda t: self._page_log(self.pg_big, t))
         self.sig.big_clr.connect(lambda: self.pg_big.tbl.setRowCount(0)); self.sig.big_add.connect(self._badd)
         self.sig.big_prog.connect(self._big_prog); self.sig.big_done.connect(self._big_done); self.sig.big_scan_count.connect(self._big_scan_count)
-        self.sig.more_clr.connect(lambda: self.pg_more.tbl.setRowCount(0)); self.sig.more_add.connect(self._madd)
+
+        self.sig.uninst_log.connect(lambda t: self._page_log(self.pg_uninstall, t))
+        self.sig.uninst_prog.connect(lambda v, m: self._page_prog(self.pg_uninstall, v, m))
+        self.sig.uninst_done.connect(self._uninst_done)
         self.sig.uninst_clr.connect(lambda: self.pg_uninstall.tbl.setRowCount(0)); self.sig.uninst_add.connect(self._uadd)
+
+        self.sig.more_log.connect(lambda t: self._page_log(self.pg_more, t))
+        self.sig.more_prog.connect(lambda v, m: self._page_prog(self.pg_more, v, m))
+        self.sig.more_done.connect(self._more_done)
+        self.sig.more_clr.connect(lambda: self.pg_more.tbl.setRowCount(0)); self.sig.more_add.connect(self._madd)
+
         self.sig.update_found.connect(self._show_update_dialog)
         self.sig.update_status.connect(self._show_update_status)
         self.sig.update_latest.connect(self.pg_setting.set_latest_version_text)
@@ -3859,19 +4430,17 @@ class MainWindow(FluentWindow):
 
     def _ts(self): return time.strftime("%H:%M:%S")
 
-    def _log(self, t):
+    def _page_log(self, page, t):
         line=f"[{self._ts()}] {t}"
-        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
-            append_capped_log(p.log, line)
-            p.sl.setText(t[:80])
+        append_capped_log(page.log, line)
+        page.sl.setText(t[:80])
 
-    def _prog(self, v, m):
-        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
-            if m <= 0:
-                p.pb.setRange(0, 0)
-            else:
-                p.pb.setRange(0, max(1, m))
-                p.pb.setValue(v)
+    def _page_prog(self, page, v, m):
+        if m <= 0:
+            page.pb.setRange(0, 0)
+        else:
+            page.pb.setRange(0, max(1, m))
+            page.pb.setValue(v)
 
     def _est(self, idx, val):
         try:
@@ -3903,13 +4472,22 @@ class MainWindow(FluentWindow):
         }.get(level, InfoBar.success)
         bar_fn("完成" if level == "success" else "提示", msg, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=4000, parent=self)
 
-    def _done(self, msg):
-        for p in (self.pg_clean, self.pg_big, self.pg_uninstall, self.pg_more):
-            p.pb.setRange(0, 100)
-            p.pb.setValue(0)
-            p.sl.setText("完成")
+    def _finish_page(self, page, msg, title="完成"):
+        page.pb.setRange(0, 100)
+        page.pb.setValue(0)
+        page.sl.setText("完成")
+        append_capped_log(page.log, f"[{self._ts()}] [完成] {msg}")
+        InfoBar.success(title, msg, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=4000, parent=self)
+
+    def _clean_done(self, msg):
         self.pg_clean.tbl.setDragEnabled(True) 
-        self._log(f"[完成] {msg}"); InfoBar.success("完成",msg,orient=Qt.Orientation.Horizontal, isClosable=True,position=InfoBarPosition.TOP,duration=4000,parent=self)
+        self._finish_page(self.pg_clean, msg)
+
+    def _uninst_done(self, msg):
+        self._finish_page(self.pg_uninstall, msg)
+
+    def _more_done(self, msg):
+        self._finish_page(self.pg_more, msg)
 
     def _badd(self, sz_str, pa):
         t=self.pg_big.tbl; r=t.rowCount(); t.setRowCount(r+1); t.setItem(r, 0, make_check_item(False)); t.setItem(r, 1, QTableWidgetItem(os.path.basename(pa) if pa else ""))
@@ -4008,6 +4586,4 @@ def main():
     w = MainWindow(); w.show(); sys.exit(app.exec())
 
 if __name__=="__main__": main()
-
-
 
